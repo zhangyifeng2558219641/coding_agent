@@ -1,0 +1,28 @@
+# 运行时数据(会话历史、记忆、自定义命令等)
+.coding_agent/
+
+# 凭据 —— 严禁提交
+.env
+.env.local
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试缓存
+.pytest_cache/
+.mypy_cache/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

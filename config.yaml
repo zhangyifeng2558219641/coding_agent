@@ -1,0 +1,90 @@
+# coding_agent 默认配置(可被用户级/项目级配置覆盖)。
+# 注意:所有 API key 一律走环境变量或 .env,严禁写在此处或代码里。
+
+provider:
+  base_url: https://api.deepseek.com   # 任意 OpenAI 兼容网关可换这里
+  model: deepseek-chat
+  temperature: 0.3
+  max_tokens: 8192
+  include_usage: true                   # 请求流式 token 用量;若网关报 400 会自动回退
+  timeout: 120
+  max_retries: 3
+  retry_backoff: 2.0
+
+context:
+  budget_tokens: 64000                  # 上下文预算,超过自动压缩历史
+  compact_ratio: 0.5
+  max_tool_output: 30000                # 单条工具结果截断上限(字符)
+
+agent:
+  max_iterations: 30                    # 单任务最大工具迭代轮数
+
+permissions:
+  mode: interactive                     # interactive | auto-approve | deny
+  sandbox: true                         # 工作区沙箱:默认只允许工作区内操作
+  allow_tools: []                       # 直接放行的工具
+  deny_tools: []                        # 直接拒绝的工具
+  ask_tools: []                         # 强制确认的工具
+  allow_commands: []                    # 正则:自动放行的命令
+  dangerous_commands:
+    - "rm\\s+-rf"
+    - "git\\s+push\\s+--force"
+    - "git\\s+reset\\s+--hard"
+    - "git\\s+clean\\s+-f"
+    - "(^|[;&|])\\s*(mkfs|dd\\s+if=)"
+    - "(^|[;&|])\\s*shutdown|reboot"
+    - "(^|[;&|])\\s*format\\s+[a-z]:"
+  sensitive_paths:
+    - ".git"
+    - "node_modules"
+  sensitive_file_names:
+    - ".env"
+    - "*.pem"
+    - "*.key"
+    - "id_rsa"
+    - "id_dsa"
+    - "id_ed25519"
+    - "*.jks"
+    - "*.p12"
+    - "credentials"
+    - "secret"
+
+memory:
+  enabled: true
+  project_file: .coding_agent/memory/project.md
+  user_file: ~/.coding_agent/memory/user.md
+
+skills:
+  dirs:
+    - skills
+    - .coding_agent/skills
+    - ~/.coding_agent/skills
+
+commands:
+  dir: .coding_agent/commands
+
+# MCP servers:名称 -> 启动命令。演示服务见 examples/mcp_server_demo.py
+mcp:
+  servers:
+    demo:
+      command: python
+      args: [examples/mcp_server_demo.py]
+      cwd: "."
+      env: {}
+
+# 生命周期钩子(可选):事件 -> [ {command: "shell"} 或 {callable: "模块.函数"} ]
+hooks: {}
+
+# Agent 团队(可选):/team <名称> <任务> 触发
+teams:
+  review-team:
+    members:
+      - name: 架构师
+        role: 方案设计与任务拆分
+        system_prompt: 先给出整体设计与实现步骤,明确边界
+      - name: 工程师
+        role: 编码实现
+        allow_tools: [ReadFile, WriteFile, EditFile, Glob, Grep, Bash]
+      - name: 审查员
+        role: 代码审查与缺陷排查
+        system_prompt: 从正确性、安全、可维护性角度挑错并给修改建议
