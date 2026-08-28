@@ -26,3 +26,9 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 临时文件
+报错文档.md
+
+# coding agent测试时生成的文件
+vibe_content/*

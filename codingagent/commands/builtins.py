@@ -189,10 +189,15 @@ def _resume(ctx, args: str) -> str:
     store = ctx.config.session_store_path()
     if not store.exists():
         return "(无历史会话)"
-    files = sorted(store.glob("*.json"))
+    files = [f for f in store.glob("*.json") if f.is_file()]
     if not files:
         return "(无历史会话)"
-    latest = files[-1]
+    # 优先恢复 CLI 会话;否则取最近修改的会话文件
+    cli_file = store / "cli.json"
+    if cli_file in files:
+        latest = cli_file
+    else:
+        latest = max(files, key=lambda p: p.stat().st_mtime)
     try:
         data = json.loads(latest.read_text(encoding="utf-8"))
         ctx.agent.history.messages = data.get("messages", [])

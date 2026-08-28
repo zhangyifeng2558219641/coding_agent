@@ -19,6 +19,47 @@ from ..types import ToolResult, truncate
 MAX_OUTPUT = 20000
 
 
+# System32\bash.exe 是 WSL 启动器、WindowsApps\bash.exe 是应用别名,
+# 都不是真正的独立 bash,无法正确处理 Windows 路径,必须排除。
+_BAD_BASH_MARKERS = ("system32", "windowsapps")
+
+
+def _git_bash_paths(bash: str) -> list[str]:
+    """非交互 bash -c 不会 source 配置文件,可能找不到 ls/grep 等 coreutils。
+    若 bash 位于 <Git>\\usr\\bin,补上 mingw64\\bin 等 Git 自带 bin 目录。"""
+    bdir = os.path.dirname(bash)
+    paths = [bdir]
+    if os.path.basename(bdir) == "bin":
+        parent = os.path.dirname(bdir)
+        git_root = os.path.dirname(parent) if os.path.basename(parent) == "usr" else parent
+        for sub in ("mingw64\\bin", "usr\\local\\bin"):
+            p = os.path.join(git_root, sub)
+            if os.path.isdir(p):
+                paths.append(p)
+    return paths
+
+
+def _find_bash() -> Optional[str]:
+    """定位可用的真 bash。
+
+    Windows 的 PATH 常常只含 Git\\cmd 而不含 Git\\usr\\bin,导致 bash/ls/grep
+    找不到;且 System32\\bash.exe 是 WSL 启动器,WindowsApps\\bash.exe 是应用别名,
+    二者都不可用。故先查已知 Git 安装位置,再退化为 PATH 里非伪装的 bash。
+    """
+    for candidate in (
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    found = shutil.which("bash")
+    if found and not any(m in found.lower() for m in _BAD_BASH_MARKERS):
+        return found
+    return None
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -60,12 +101,17 @@ class Bash(Tool):
         cwd = ctx.resolve(kwargs["cwd"]) if kwargs.get("cwd") else (ctx.cwd or ctx.workspace)
         timeout = int(kwargs.get("timeout") or 120)
 
+        bash = _find_bash()
+
         env = dict(os.environ)
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["WORKSPACE"] = str(ctx.workspace)
         env["CWD"] = str(cwd)
+        if bash:
+            extra = _git_bash_paths(bash)
+            if extra:
+                env["PATH"] = os.pathsep.join([*extra, env.get("PATH", "")])
 
-        bash = shutil.which("bash")
         if bash:
             argv = [bash, "-c", command]
             start_new_session = True

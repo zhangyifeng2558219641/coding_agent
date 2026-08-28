@@ -80,6 +80,8 @@ class CLIUI(UISink):
             f"· 回合结束({d.get('iterations')} 轮工具,耗时 {d.get('elapsed')}s,"
             f"tok: {u.get('prompt_tokens', 0)}/{u.get('completion_tokens', 0)})",
             style="dim")
+        if d.get("error"):
+            self.console.print(f"✗ {d['error']}", style="red")
 
     def _ev_error(self, d: dict[str, Any]) -> None:
         self._end_text()
@@ -176,6 +178,9 @@ def run_cli(session) -> None:
             console.print("\n(已中断当前回合,可继续对话)", style="yellow")
         except Exception as e:
             console.print(f"✗ 回合异常: {e}", style="red")
+        finally:
+            # 持久化会话历史,供下次启动 /resume 恢复
+            session.save_history(agent.history, "cli")
 
     session.close()
 

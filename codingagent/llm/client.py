@@ -227,7 +227,9 @@ class ChatClient:
             return
 
         calls = []
-        for slot in sorted(pending.values()):
+        # 按工具调用序号排序(不能对 dict 值排序,Python3 不支持 dict 比较)
+        for idx in sorted(pending):
+            slot = pending[idx]
             raw_args = slot["arguments"]
             try:
                 args = json.loads(raw_args) if raw_args.strip() else {}

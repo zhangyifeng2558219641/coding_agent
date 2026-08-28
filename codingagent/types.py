@@ -49,6 +49,9 @@ class ToolResult:
     def content(self) -> str:
         if self.success:
             return self.output
+        # 失败时也带上实际输出(stdout/stderr),否则模型和用户都看不到失败原因
+        if self.output:
+            return f"[工具执行失败: {self.error}]\n{self.output}"
         return f"[工具执行失败: {self.error}]"
 
     def to_message(self) -> dict[str, Any]:

@@ -146,7 +146,7 @@ class AgentLoop:
                             self.ui.event("text", {"delta": ev.text})
                         elif ev.type == "tool_calls":
                             calls = ev.calls
-                        elif ev.type == "usage":
+                        elif ev.type in ("usage", "finish"):
                             self._usage += ev.usage
                         elif ev.type == "error":
                             last_error = ev.message
@@ -267,6 +267,9 @@ class AgentLoop:
         except Exception as e:
             result = ToolResult(name=call.name, call_id=call.id, success=False,
                                 error=f"工具异常: {type(e).__name__}: {e}")
+        # 工具自身创建的 ToolResult 通常不带 call_id,必须补上,
+        # 否则发给模型的 tool 消息 tool_call_id 为空,网关会 400 拒绝
+        result.call_id = call.id
 
         if self.hooks:
             self.hooks.fire_post_tool(call.name, result)
