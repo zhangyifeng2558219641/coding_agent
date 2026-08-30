@@ -390,32 +390,32 @@ function addMsg(role, text) {
   b.textContent = text; m.appendChild(b);
   $("messages").appendChild(m);
   $("messages").scrollTop = $("messages").scrollHeight;
-  return b;
+  return m;
+}
+function addToolCard(parent, name, args, output, status) {
+  const card = document.createElement("div");
+  card.className = "toolcard open";
+  card.innerHTML = `<div class="th"><span>⚙ ${esc(name)}</span><span class="badge ${status==="err"?"err":"ok"}">${esc(status||"ok")}</span></div>
+                    <div class="tb">${esc(args)}${output ? "\\n\\n" + esc(output) : ""}</div>`;
+  card.querySelector(".th").onclick = () => card.classList.toggle("open");
+  (parent || $("messages")).appendChild(card);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return card;
 }
 function renderMessages(messages) {
   const wrap = $("messages"); wrap.innerHTML = "";
   (messages||[]).forEach(m => {
     if (m.role === "user") addMsg("user", m.content || "");
     else if (m.role === "assistant") {
-      if (m.tool_calls && m.tool_calls.length) {
-        addMsg("assistant", m.content || "(调用工具)");
-        m.tool_calls.forEach(tc => addToolCard(tc.function.name, tc.function.arguments, "", ""));
-      } else addMsg("assistant", m.content || "");
+      const hasTools = !!(m.tool_calls && m.tool_calls.length);
+      const msg = addMsg("assistant", m.content || (hasTools ? "(调用工具)" : ""));
+      if (hasTools) m.tool_calls.forEach(tc => addToolCard(msg, tc.function.name, tc.function.arguments, "", ""));
     } else if (m.role === "tool") {
       const last = wrap.querySelector(".toolcard:last-of-type");
       if (last) { last.classList.add(m.content.includes("失败") ? "err":"ok");
                   last.querySelector(".tb").textContent += "\\n\\n" + m.content; }
     }
   });
-}
-function addToolCard(name, args, output, status) {
-  const card = document.createElement("div");
-  card.className = "toolcard open";
-  card.innerHTML = `<div class="th"><span>⚙ ${esc(name)}</span><span class="badge ${status==="err"?"err":"ok"}">${esc(status||"ok")}</span></div>
-                    <div class="tb">${esc(args)}${output ? "\\n\\n" + esc(output) : ""}</div>`;
-  card.querySelector(".th").onclick = () => card.classList.toggle("open");
-  $("messages").appendChild(card);
-  $("messages").scrollTop = $("messages").scrollHeight;
 }
 
 function parseSSE(data) {
@@ -429,15 +429,30 @@ function parseSSE(data) {
   return out;
 }
 
+// ---- 流式渲染:按"轮"归组,一段文本和紧随其后的工具调用放入同一消息块 ----
+// 用 status("第 N 轮推理…") 作为轮次边界:每轮开头强制新消息块,
+// 轮内的多个(并行)工具调用归入同一块。
+let currentMsg = null, currentBubble = null, roundStart = false;
+function clearCursor() {
+  if (currentBubble) { const c = currentBubble.querySelector(".cursor"); if (c) c.remove(); }
+}
+function ensureAssistantBubble(forceNew) {
+  if (forceNew || !currentBubble || roundStart) {
+    clearCursor();
+    currentMsg = addMsg("assistant", "");
+    currentBubble = currentMsg.querySelector(".bubble");
+    roundStart = false;
+  }
+  return currentBubble;
+}
+
 async function send() {
   const text = $("input").value.trim();
   if (!text || state.busy) return;
   if (!state.cur) await newConv();
   $("input").value = ""; state.busy = true; $("send").disabled = true;
   addMsg("user", text);
-
-  const bubble = addMsg("assistant", "");
-  const cursor = document.createElement("span"); cursor.className="cursor"; bubble.appendChild(cursor);
+  currentMsg = null; currentBubble = null; roundStart = false;
   const wrap = $("messages");
   let buf = "";
   try {
@@ -452,31 +467,41 @@ async function send() {
       let idx;
       while ((idx = buf.indexOf("\\n\\n")) !== -1) {
         const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-        for (const ev of parseSSE(block)) handleEvent(ev, bubble, cursor, wrap);
+        for (const ev of parseSSE(block)) handleEvent(ev, wrap);
       }
     }
   } catch(e) {
-    bubble.textContent = "请求失败: " + e.message;
+    ensureAssistantBubble().textContent += "\\n请求失败: " + e.message;
   }
-  cursor.remove(); state.busy = false; $("send").disabled = false;
+  clearCursor(); state.busy = false; $("send").disabled = false;
 }
 
-function handleEvent(ev, bubble, cursor, wrap) {
+function handleEvent(ev, wrap) {
   let d; try { d = JSON.parse(ev.data); } catch { d = {}; }
   switch (ev.event) {
-    case "text": bubble.textContent += d.delta || ""; cursor.remove();
-                 bubble.appendChild(cursor); break;
-    case "tool_call": addToolCard(d.name, JSON.stringify(d.arguments||{}), "", d.status); break;
+    case "text": {
+      const b = ensureAssistantBubble();
+      clearCursor();
+      b.textContent += (d.delta || "");
+      const cursor = document.createElement("span"); cursor.className="cursor"; b.appendChild(cursor);
+      break; }
+    case "tool_call":
+      ensureAssistantBubble();
+      if (!currentBubble.textContent.trim()) currentBubble.textContent = "(调用工具)";
+      addToolCard(currentMsg, d.name, JSON.stringify(d.arguments||{}), "", d.status);
+      clearCursor();
+      break;
     case "tool_result": {
-      const cards = wrap.querySelectorAll(".toolcard");
+      const cards = currentMsg ? currentMsg.querySelectorAll(".toolcard") : [];
       const last = cards[cards.length-1];
       if (last) { last.classList.add(d.success ? "ok" : "err");
                   last.querySelector(".tb").textContent += "\\n\\n" + (d.output || d.error || ""); }
       break; }
-    case "status": { const s = document.createElement("div");
+    case "status": { roundStart = true;
+                     const s = document.createElement("div");
                      s.className="msg system"; s.innerHTML=`<div class="bubble">${esc(d.message||"")}</div>`;
                      wrap.appendChild(s); wrap.scrollTop = wrap.scrollHeight; break; }
-    case "error": bubble.textContent += "\\n✗ " + (d.message || ""); break;
+    case "error": ensureAssistantBubble().textContent += "\\n✗ " + (d.message || ""); break;
     case "done": refreshList(); break;
   }
   wrap.scrollTop = wrap.scrollHeight;
