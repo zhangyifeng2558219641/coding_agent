@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import Any, Optional
 
 from rich.console import Console
@@ -107,6 +108,30 @@ class CLIUI(UISink):
             if a in ("n", "no", "否", "拒绝"):
                 return False
 
+    def choose(self, prompt: str, options: list[str]) -> Optional[int]:
+        """交互选择:打印编号列表并等待输入,返回 0-based 索引或 -1(取消)。"""
+        self._end_text()
+        console = self.console
+        console.print(prompt)
+        for i, opt in enumerate(options, 1):
+            console.print(f"  [{i}] {opt}")
+        while True:
+            try:
+                ans = console.input("[yellow]请选择编号(0 取消): [/yellow]")
+            except (EOFError, KeyboardInterrupt):
+                return -1
+            ans = ans.strip()
+            if ans == "0":
+                return -1
+            try:
+                n = int(ans)
+            except ValueError:
+                console.print("(请输入数字)", style="dim")
+                continue
+            if 1 <= n <= len(options):
+                return n - 1
+            console.print(f"(编号需在 1-{len(options)} 之间)", style="dim")
+
 
 def _read_multiline(console: Console) -> str:
     """读取输入;以 \\ 结尾的行自动续行(多行输入)。"""
@@ -152,6 +177,8 @@ def run_cli(session) -> None:
     agent = session.make_agent()
     ctx = session.context(agent)
     session.cli_running = True
+    # 本次 CLI 会话的唯一标识:历史保存为 cli-<时间戳>.json,便于 /resume 区分多次会话
+    cli_sid = time.strftime("%Y%m%d-%H%M%S")
 
     console.print(f"工作区: {session.workspace}   模型: {agent.client.model}", style="dim")
 
@@ -179,8 +206,8 @@ def run_cli(session) -> None:
         except Exception as e:
             console.print(f"✗ 回合异常: {e}", style="red")
         finally:
-            # 持久化会话历史,供下次启动 /resume 恢复
-            session.save_history(agent.history, "cli")
+            # 持久化会话历史,供下次启动 /resume 恢复(每个 CLI 会话独立文件)
+            session.save_history(agent.history, f"cli-{cli_sid}")
 
     session.close()
 

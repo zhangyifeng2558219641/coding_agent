@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from ..agent import Team, TeamMember, WorktreeManager, WorktreeError
@@ -184,20 +185,61 @@ def _status(ctx, args: str) -> str:
             f"MCP: {len(ctx.mcp.list_servers())} 个")
 
 
+def _fmt_cli_session(f: Path) -> str:
+    """把 cli-<时间戳>.json 显示成可读时间;旧版单文件 cli.json 标注为旧版。"""
+    stem = f.stem
+    if not stem.startswith("cli-"):
+        return "旧版会话"
+    ts = stem[len("cli-"):]
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(ts, "%Y%m%d-%H%M%S"))
+    except ValueError:
+        return ts
+
+
 def _resume(ctx, args: str) -> str:
-    """把持久化的会话历史重新注入当前 agent(CLI 场景)。"""
+    """恢复 CLI 历史会话:不带参数恢复最新,list 列出全部,数字编号选择指定会话。"""
     store = ctx.config.session_store_path()
     if not store.exists():
         return "(无历史会话)"
-    files = [f for f in store.glob("*.json") if f.is_file()]
+    # 每个 CLI 会话一个 cli-<时间戳>.json(新在前);旧版单文件 cli.json 视为最旧
+    files = sorted((f for f in store.glob("cli-*.json") if f.is_file()), reverse=True)
+    legacy = store / "cli.json"
+    if legacy.is_file():
+        files.append(legacy)
     if not files:
         return "(无历史会话)"
-    # 优先恢复 CLI 会话;否则取最近修改的会话文件
-    cli_file = store / "cli.json"
-    if cli_file in files:
-        latest = cli_file
+
+    a = args.strip().lower()
+    if a in ("list", "ls", "-l"):
+        lines = ["可用 CLI 会话历史(最新在前):"]
+        for i, f in enumerate(files, 1):
+            lines.append(f"  [{i}] {_fmt_cli_session(f)}  ({f.name})")
+        lines.append("用法:/resume [编号] —— 恢复指定会话;不带编号交互选择(单个会话时直接恢复)")
+        return "\n".join(lines)
+
+    if a:
+        try:
+            idx = int(a)
+        except ValueError:
+            return f"无效编号: {a}(用 /resume list 查看会话列表)"
+        if not (1 <= idx <= len(files)):
+            return f"编号越界: {idx}(共 {len(files)} 个会话,用 /resume list 查看)"
+        latest = files[idx - 1]
+    elif len(files) > 1:
+        # 多个会话:交互选择;无交互能力的 UI(如 Web)回退到最新
+        picked = ctx.ui.choose(
+            "检测到多个 CLI 历史会话,请选择要恢复的:",
+            [f"{_fmt_cli_session(f)}  ({f.name})" for f in files])
+        if picked is None:
+            latest = files[0]
+        elif picked == -1:
+            return "(已取消恢复)"
+        else:
+            latest = files[picked]
     else:
-        latest = max(files, key=lambda p: p.stat().st_mtime)
+        latest = files[0]
+
     try:
         data = json.loads(latest.read_text(encoding="utf-8"))
         ctx.agent.history.messages = data.get("messages", [])
@@ -223,4 +265,4 @@ def register_builtin_commands(registry) -> None:
     registry.register(SlashCommand("mcp", "管理 MCP servers", _mcp))
     registry.register(SlashCommand("team", "运行 Agent 团队", _team))
     registry.register(SlashCommand("worktree", "管理 Git worktree", _worktree))
-    registry.register(SlashCommand("resume", "恢复最近会话历史(CLI)", _resume))
+    registry.register(SlashCommand("resume", "恢复 CLI 历史会话(多个会话时交互选择,list 查看列表)", _resume))

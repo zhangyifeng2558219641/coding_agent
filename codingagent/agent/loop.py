@@ -35,6 +35,14 @@ class UISink:
         """交互确认;无交互能力时返回 False(默认拒绝)。"""
         return False
 
+    def choose(self, prompt: str, options: list[str]) -> Optional[int]:
+        """让用户在选项中挑选,返回 0-based 索引。
+
+        None:当前 UI 不支持交互选择(调用方应自行兜底,如恢复最新);
+        -1:用户取消;其余为选中索引。
+        """
+        return None
+
 
 @dataclass
 class AgentOptions:
