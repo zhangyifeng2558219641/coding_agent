@@ -5,7 +5,42 @@ from __future__ import annotations
 from pathlib import Path
 
 from codingagent.types import ToolCall
-from conftest import make_agent, make_config
+from conftest import MockClient, make_agent, make_config
+
+
+def test_loop_llm_error_is_visible(workspace: Path):
+    """LLM 调用失败(重试耗尽)时必须以 error 事件显式结束,而非静默停住。
+
+    回归:此前 LLMError 只写进 last_error 就 break,不发任何事件,Web/CLI
+    均显示为一轮"无声结束",用户只得再问一句"成功了吗"才继续。
+    """
+    from codingagent.agent.loop import AgentLoop, UISink
+    from codingagent.agent.permissions import PermissionPolicy
+    from codingagent.llm import LLMError
+    from codingagent.tools import default_registry
+
+    class RecordingUI(UISink):
+        def __init__(self):
+            self.events: list = []
+
+        def event(self, type, data):
+            self.events.append((type, data))
+
+    class FailingClient(MockClient):
+        def chat_stream(self, messages, tools=None, **kw):
+            raise LLMError("API 连接失败")
+
+    config = make_config(workspace)
+    ui = RecordingUI()
+    reg = default_registry(with_memory=True, with_agent_tools=False)
+    agent = AgentLoop(config, workspace, FailingClient([]), reg,
+                      permissions=PermissionPolicy(config.permissions, workspace),
+                      ui=ui)
+    result = agent.run("测试错误")
+    assert not result.success
+    errors = [d.get("message") for t, d in ui.events if t == "error"]
+    assert errors, "LLM 失败必须以 error 事件上报,否则 UI 静默结束"
+    assert "API 连接失败" in errors[0]
 
 
 def test_loop_writes_file(workspace: Path):

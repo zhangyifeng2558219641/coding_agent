@@ -160,13 +160,18 @@ class AgentLoop:
                             last_error = ev.message
                 except LLMError as e:
                     last_error = str(e)
-                    break
 
                 text = "".join(text_parts)
                 final_text += text
 
+                # LLM 出错(网络/网关重试耗尽)→ 本回合到此为止,原因交给下方集中上报
+                if last_error:
+                    break
+
                 if not calls:
                     # 没有工具调用 → 输出最终答复,循环终止
+                    if not text.strip():
+                        last_error = "模型返回了空响应(无文本且无工具调用)"
                     self.history.append({"role": "assistant", "content": text})
                     break
 
@@ -191,6 +196,10 @@ class AgentLoop:
         except KeyboardInterrupt:
             last_error = "用户中断"
             self._interrupted = True
+
+        # 异常结束(LLM 失败/空响应/超限/中断)一律显式上报,避免 UI 静默结束
+        if last_error:
+            self.ui.event("error", {"message": last_error})
 
         self._fire("agent_end")
 

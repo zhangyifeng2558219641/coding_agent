@@ -81,8 +81,6 @@ class CLIUI(UISink):
             f"· 回合结束({d.get('iterations')} 轮工具,耗时 {d.get('elapsed')}s,"
             f"tok: {u.get('prompt_tokens', 0)}/{u.get('completion_tokens', 0)})",
             style="dim")
-        if d.get("error"):
-            self.console.print(f"✗ {d['error']}", style="red")
 
     def _ev_error(self, d: dict[str, Any]) -> None:
         self._end_text()

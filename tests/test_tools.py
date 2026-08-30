@@ -1,16 +1,56 @@
-"""核心工具(文件/搜索)的单元测试。"""
+"""核心工具(文件/搜索/命令执行)的单元测试。"""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import pytest
+
 from codingagent.tools import (
-    EditFile, Glob, Grep, ReadFile, ToolContext, WriteFile, default_registry,
+    Bash, EditFile, Glob, Grep, ReadFile, ToolContext, WriteFile, default_registry,
 )
+from codingagent.tools.shell import _find_bash
 
 
 def make_ctx(workspace: Path) -> ToolContext:
     return ToolContext(workspace=workspace, cwd=workspace)
+
+
+bash_or_skip = pytest.mark.skipif(_find_bash() is None, reason="需要可用的 bash")
+
+
+@bash_or_skip
+def test_bash_normal(workspace):
+    r = Bash().run(make_ctx(workspace), command="echo hello-bash")
+    assert r.success
+    assert "hello-bash" in r.output
+
+
+@bash_or_skip
+def test_bash_foreground_timeout_returns(workspace):
+    """前台命令超时必须返回,而不是永久卡死。
+
+    回归:Windows 上 subprocess.run 超时只杀直接子进程,残留子进程继续持有
+    stdout 管道,communicate() 永久阻塞导致工具卡死。
+    """
+    t = time.monotonic()
+    r = Bash().run(make_ctx(workspace), command="sleep 60", timeout=2)
+    dt = time.monotonic() - t
+    assert not r.success
+    assert "已终止" in r.output
+    assert dt < 20  # 允许 taskkill 清理开销,但绝不能无限阻塞
+
+
+@bash_or_skip
+def test_bash_background_job_returns_promptly(workspace):
+    """后台任务不阻塞工具:& 启动的长进程应随前台命令立即返回,而非等到超时。"""
+    t = time.monotonic()
+    r = Bash().run(make_ctx(workspace), command="sleep 5 & echo bg-done", timeout=6)
+    dt = time.monotonic() - t
+    assert r.success
+    assert "bg-done" in r.output
+    assert dt < 5
 
 
 def test_registry():

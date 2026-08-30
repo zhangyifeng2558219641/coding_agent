@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolContext
@@ -61,14 +63,22 @@ def _find_bash() -> Optional[str]:
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
+    """整树终止:taskkill /T(Windows)或按进程组 kill(POSIX)。
+
+    不要用 proc.poll() 提前返回:超时清理时,直接子进程可能已退出但孙进程
+    (后台任务/curl)仍持有管道,照样需要连根清除。
+    """
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            capture_output=True, timeout=10)
         else:
-            os.killpg(os.getpgid(proc.pid), 9)
+            # start_new_session=True 使直接子进程成为新会话组长(组号=其 pid);
+            # 组长已退出时按组号仍可清掉残留孙进程。
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except ProcessLookupError:
+                os.killpg(proc.pid, 9)
     except Exception:
         try:
             proc.kill()
@@ -119,23 +129,47 @@ class Bash(Tool):
             argv = command
             start_new_session = False
 
-        try:
-            proc = subprocess.run(
-                argv, cwd=str(cwd), env=env, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=timeout, shell=not bash,
-                start_new_session=start_new_session,
-            )
-            rc, stdout, stderr = proc.returncode, proc.stdout or "", proc.stderr or ""
-        except subprocess.TimeoutExpired as e:
-            if e.stdout:
-                stdout = e.stdout.decode("utf-8", "replace")
-            else:
-                stdout = ""
-            stderr = f"(命令执行超过 {timeout}s,已终止)"
-            rc = 124
-        except OSError as e:
-            return ToolResult(name=self.name, success=False, error=f"无法执行命令: {e}")
+        # stdout/stderr 落到临时文件而非捕获管道:Windows 下用管道时,后台任务
+        # /孙进程(curl、后台 server 等)会继承管道写端,读端永远等不到 EOF,
+        # 导致 communicate() 永久阻塞(subprocess.run 的经典死锁,工具随之卡死)。
+        # 改为临时文件后父进程只 proc.wait(超时),不依赖管道 EOF,天然免疫该问题。
+        with tempfile.TemporaryDirectory(prefix="coding_agent_",
+                                         ignore_cleanup_errors=True) as td:
+            out_path = os.path.join(td, "stdout.txt")
+            err_path = os.path.join(td, "stderr.txt")
+            try:
+                with open(out_path, "w", encoding="utf-8", errors="replace") as fo, \
+                     open(err_path, "w", encoding="utf-8", errors="replace") as fe:
+                    proc = subprocess.Popen(
+                        argv, cwd=str(cwd), env=env,
+                        stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+                        shell=not bash,
+                        start_new_session=start_new_session,
+                    )
+            except OSError as e:
+                return ToolResult(name=self.name, success=False, error=f"无法执行命令: {e}")
+
+            try:
+                rc = proc.wait(timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)  # 超时:整树终止,不留后台进程/孙进程占资源
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                rc = 124
+                timed_out = True
+
+            def _read(p: str) -> str:
+                try:
+                    return Path(p).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return ""
+
+            stdout, stderr = _read(out_path), _read(err_path)
+            if timed_out:
+                stderr = f"(命令执行超过 {timeout}s,已终止)\n{stderr}".strip()
 
         output = ""
         if stdout:
