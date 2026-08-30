@@ -259,7 +259,18 @@ _INDEX_HTML = """<!DOCTYPE html>
 <title>coding_agent · 编程智能体</title>
 <style>
   :root { --bg:#0f1117; --panel:#171a23; --panel2:#1d212e; --text:#e6e8ef;
-          --dim:#8a90a3; --accent:#5b8cff; --border:#2a2f3d; --ok:#3ddc84; --err:#ff6b6b; }
+          --dim:#8a90a3; --accent:#5b8cff; --border:#2a2f3d; --ok:#3ddc84; --err:#ff6b6b;
+          --on-accent:#ffffff; }
+  /* 整体颜色风格:工具栏「主题」下拉即时切换,选择存 localStorage */
+  html[data-theme="light"] { --bg:#f5f7fa; --panel:#ffffff; --panel2:#eef1f6; --text:#1f2933;
+          --dim:#66707c; --accent:#2563eb; --border:#d5dbe3; --ok:#16a34a; --err:#dc2626;
+          --on-accent:#ffffff; }
+  html[data-theme="warm"] { --bg:#fbf6ec; --panel:#fffdf5; --panel2:#f2ead7; --text:#3d3a34;
+          --dim:#8a8378; --accent:#8a6d3b; --border:#e3d8c0; --ok:#5f8a3b; --err:#c0563b;
+          --on-accent:#ffffff; }
+  html[data-theme="nord"] { --bg:#1b1e27; --panel:#232a3b; --panel2:#2c3547; --text:#d8dee9;
+          --dim:#8294ad; --accent:#88c0d0; --border:#3a4458; --ok:#a3be8c; --err:#bf616a;
+          --on-accent:#11141c; }
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:var(--bg); color:var(--text); font-family:"Segoe UI", system-ui, "Microsoft YaHei", sans-serif;
          display:flex; height:100vh; overflow:hidden; }
@@ -268,7 +279,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   #sidebar h1 { font-size:15px; padding:16px 14px; letter-spacing:.5px; }
   #sidebar h1 span { color:var(--accent); }
   #newBtn { margin:0 12px 10px; padding:9px; background:var(--accent); border:none; border-radius:8px;
-            color:#fff; font-size:13px; cursor:pointer; }
+            color:var(--on-accent); font-size:13px; cursor:pointer; }
   #convList { flex:1; overflow-y:auto; }
   .conv { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px;
           color:var(--dim); display:flex; justify-content:space-between; align-items:center; }
@@ -287,7 +298,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   .msg .bubble { padding:10px 14px; border-radius:10px; white-space:pre-wrap; word-break:break-word;
                  font-size:14px; line-height:1.55; }
   .msg.user { text-align:right; }
-  .msg.user .bubble { background:var(--accent); color:#fff; display:inline-block; text-align:left; }
+  .msg.user .bubble { background:var(--accent); color:var(--on-accent); display:inline-block; text-align:left; }
   .msg.assistant .bubble { background:var(--panel); border:1px solid var(--border); }
   .msg.system .bubble { background:transparent; color:var(--dim); text-align:center; font-size:12px; }
   .toolcard { margin-top:8px; border:1px solid var(--border); border-left:3px solid var(--accent);
@@ -305,7 +316,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   #input { flex:1; background:var(--panel2); border:1px solid var(--border); border-radius:10px;
            color:var(--text); padding:12px 14px; font-size:14px; outline:none; resize:none; height:50px; }
   #input:focus { border-color:var(--accent); }
-  #send { width:70px; border:none; border-radius:10px; background:var(--accent); color:#fff; cursor:pointer; }
+  #send { width:70px; border:none; border-radius:10px; background:var(--accent); color:var(--on-accent); cursor:pointer; }
   #send:disabled { opacity:.5; cursor:not-allowed; }
   .badge { padding:2px 8px; border-radius:10px; font-size:11px; }
   .badge.ok { background:rgba(61,220,132,.15); color:var(--ok); }
@@ -327,6 +338,12 @@ _INDEX_HTML = """<!DOCTYPE html>
       <option value="interactive">权限:交互(Web 下未知操作默认拒绝)</option>
       <option value="auto-approve">权限:自动放行</option>
       <option value="deny">权限:严格拒绝</option>
+    </select>
+    <select id="themeSelect" title="切换整体颜色风格">
+      <option value="dark">主题:深色</option>
+      <option value="light">主题:浅色</option>
+      <option value="warm">主题:暖色护眼</option>
+      <option value="nord">主题:夜间蓝</option>
     </select>
     <button id="clearBtn">清空当前会话</button>
   </div>
@@ -514,6 +531,14 @@ $("input").addEventListener("keydown", e => {
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };
 $("permSelect").onchange = e => state.permMode = e.target.value;
+const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝"};
+function applyTheme(name) {
+  if (!THEMES[name]) name = "dark";
+  document.documentElement.dataset.theme = name;
+  if ($("themeSelect").value !== name) $("themeSelect").value = name;
+  try { localStorage.setItem("coding_agent_theme", name); } catch(e) {}
+}
+$("themeSelect").onchange = e => applyTheme(e.target.value);
 async function sendSlash(cmd) {
   if (!state.cur) await newConv();
   addMsg("user", cmd);
@@ -527,6 +552,9 @@ async function sendSlash(cmd) {
       for(const ev of parseSSE(bl)){if(ev.event==="text"){let d=JSON.parse(ev.data);bubble.textContent+=d.delta||"";}}} }
 }
 async function init() {
+  let saved = "dark";
+  try { saved = localStorage.getItem("coding_agent_theme") || "dark"; } catch(e) {}
+  applyTheme(saved);
   await refreshConfig(); await refreshList();
   const convs = state.convs;
   if (convs.length) await openConv(convs[0].id);
