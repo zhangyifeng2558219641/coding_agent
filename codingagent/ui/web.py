@@ -377,7 +377,7 @@ async function refreshList() {
     const div = document.createElement("div");
     div.className = "conv" + (c.id === state.cur ? " active" : "");
     div.innerHTML = `<span class="t">${esc(c.title)}</span><button class="del">✕</button>`;
-    div.querySelector(".t").onclick = () => openConv(c.id);
+    div.onclick = () => openConv(c.id);
     div.querySelector(".del").onclick = async e => {
       e.stopPropagation();
       await api("/api/conversations/" + c.id, {method:"DELETE"});
@@ -390,9 +390,15 @@ async function refreshList() {
 async function openConv(id) {
   state.cur = id;
   refreshList();
-  const data = await api("/api/conversations/" + id);
-  $("messages").innerHTML = "";
-  renderMessages(data.messages);
+  currentMsg = null; currentBubble = null; roundStart = false;
+  try {
+    const data = await api("/api/conversations/" + id);
+    $("messages").innerHTML = "";
+    renderMessages(data.messages);
+  } catch(e) {
+    $("messages").innerHTML = "";
+    addMsg("system", "加载会话失败: " + (e.message || e));
+  }
 }
 async function newConv() {
   const c = await api("/api/conversations", {method:"POST", body: JSON.stringify({title:"新会话"})});
