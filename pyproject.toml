@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codingagent"
+version = "0.1.0"
+description = "自研编程智能体(类 Claude Code):自主读写文件、执行命令完成编程任务。"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "rich>=13.7.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+codingagent = "codingagent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["codingagent*"]
