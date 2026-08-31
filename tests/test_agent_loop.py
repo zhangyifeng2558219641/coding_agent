@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from codingagent.types import ToolCall
+from codingagent.llm import History, StreamEvent
+from codingagent.types import ToolCall, Usage
 from conftest import MockClient, make_agent, make_config
 
 
@@ -132,6 +133,69 @@ def test_loop_termination_max_iterations(workspace: Path):
     agent = make_agent(config, workspace, script=script)
     result = agent.run("循环调用")
     assert result.iterations <= 3
+
+
+def _make_agent_with_history(config, workspace, history, client):
+    from codingagent.agent.loop import AgentLoop
+    from codingagent.agent.permissions import PermissionPolicy
+    from codingagent.tools import default_registry
+    reg = default_registry(with_memory=True, with_agent_tools=False)
+    return AgentLoop(config, workspace, client, reg,
+                     permissions=PermissionPolicy(config.permissions, workspace),
+                     history=history)
+
+
+class UsageClient(MockClient):
+    """每轮固定上报 usage 的假 LLM,模拟网关返回 usage。"""
+
+    def chat_stream(self, messages, tools=None, **kw):
+        yield StreamEvent(type="text", text="已处理")
+        yield StreamEvent(type="finish", reason="stop", usage=Usage(100, 20))
+
+
+def test_history_usage_serialization(workspace: Path):
+    """History 的 usage 随 to_dict/load_dict 往返持久化,且兼容旧存档。"""
+    h = History()
+    h.usage = Usage(123, 45)
+    data = h.to_dict()
+    assert data["usage"] == {"prompt_tokens": 123, "completion_tokens": 45}
+
+    h2 = History()
+    h2.load_dict(data)
+    assert h2.usage.prompt_tokens == 123 and h2.usage.completion_tokens == 45
+
+    # 旧存档没有 usage 键 → 缺省为 0
+    h3 = History()
+    h3.load_dict({"messages": [], "summary": "", "compact_count": 0})
+    assert h3.usage.total == 0
+
+
+def test_usage_accumulates_across_web_requests(workspace: Path):
+    """回归:Web 每请求新建 Agent,usage 必须从会话历史续接累计,而非每轮清零。
+
+    /cost 此前恒为 0 的根因:新 agent 的 _usage 从 Usage() 起步,且不回写。
+    """
+    config = make_config(workspace)
+    h = History()
+
+    # 请求 1:新 agent 跑一轮,usage 累计并写回 history
+    a1 = _make_agent_with_history(config, workspace, h, UsageClient([]))
+    a1.run("hello")
+    assert h.usage.total == 120
+
+    # 模拟 web 从磁盘 load_history:usage 应被恢复
+    h2 = History()
+    h2.load_dict(h.to_dict())
+    assert h2.usage.total == 120
+
+    # 请求 2:另一全新 agent 续接累计,再跑一轮
+    a2 = _make_agent_with_history(config, workspace, h2, UsageClient([]))
+    a2.run("hello again")
+    assert h2.usage.total == 240
+
+    # /cost 场景:未跑新一轮的 agent(未发 LLM 请求)也应显示已累计用量
+    a3 = _make_agent_with_history(config, workspace, h2, MockClient([]))
+    assert a3.usage.total == 240
 
 
 def test_history_compact(workspace: Path):

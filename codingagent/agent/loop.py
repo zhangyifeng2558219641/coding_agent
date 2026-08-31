@@ -95,7 +95,7 @@ class AgentLoop:
             self.history.add_system_part("base", base_system_prompt(self.workspace))
         if memory and memory.enabled:
             self.history.add_system_part("memory", memory.load_all())
-        self._usage = Usage()
+        self._usage = self.history.usage
         self._tool_history: list[dict[str, Any]] = []
         self._interrupted = False
         self._compact_count = 0
@@ -202,6 +202,8 @@ class AgentLoop:
             self.ui.event("error", {"message": last_error})
 
         self._fire("agent_end")
+
+        self.history.usage = self._usage  # 写回,供会话持久化/跨请求累计
 
         success = not last_error and bool(final_text.strip())
         result = FinalResult(

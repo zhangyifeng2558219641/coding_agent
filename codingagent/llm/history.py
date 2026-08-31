@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Optional
 
-from ..types import truncate
+from ..types import Usage, truncate
 from .tokens import estimate_messages_tokens
 
 # 压缩时保留最近 N 条消息不压缩,防止把正在进行的工作也摘要掉
@@ -33,6 +33,7 @@ class History:
         self.max_tool_output = max_tool_output
         self.compact_count = 0
         self.summary = ""
+        self.usage = Usage()
 
     # ------------------------------------------------------------------ 系统提示
     def add_system_part(self, key: str, text: str) -> None:
@@ -73,12 +74,17 @@ class History:
     def to_dict(self) -> dict[str, Any]:
         """持久化消息与摘要状态(不含 system parts,由会话层重建)。"""
         return {"messages": self.messages, "summary": self.summary,
-                "compact_count": self.compact_count}
+                "compact_count": self.compact_count,
+                "usage": {"prompt_tokens": self.usage.prompt_tokens,
+                          "completion_tokens": self.usage.completion_tokens}}
 
     def load_dict(self, data: dict[str, Any]) -> None:
         self.messages = list(data.get("messages", []) or [])
         self.summary = data.get("summary", "") or ""
         self.compact_count = int(data.get("compact_count", 0) or 0)
+        u = data.get("usage") or {}
+        self.usage = Usage(int(u.get("prompt_tokens", 0) or 0),
+                           int(u.get("completion_tokens", 0) or 0))
 
     def count(self) -> int:
         return len(self.messages)
