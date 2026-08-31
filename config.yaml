@@ -3,7 +3,7 @@
 
 provider:
   base_url: https://api.deepseek.com   # 任意 OpenAI 兼容网关可换这里
-  model: deepseek-chat
+  model: deepseek-v4-flash
   temperature: 0.3
   max_tokens: 8192
   include_usage: true                   # 请求流式 token 用量;若网关报 400 会自动回退

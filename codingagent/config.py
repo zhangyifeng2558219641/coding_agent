@@ -24,7 +24,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "provider": {
         # DeepSeek 为默认厂商;任意 OpenAI 兼容网关都可通过 base_url 切换
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "temperature": 0.3,
         "max_tokens": 8192,
         # 请求时附带 stream_options.include_usage;若网关报 400 会自动回退去掉
