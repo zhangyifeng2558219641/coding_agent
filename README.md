@@ -8,11 +8,13 @@
 conda create -n coding_agent python=3.13 -y
 conda activate coding_agent
 pip install -r requirements.txt
-cp .env.example .env    # 填入 DEEPSEEK_API_KEY
+pip install -e .            # 可编辑安装:之后可在任意目录启动,用 -w 指定工作区
+cp .env.example .env    # 填入 DEEPSEEK_API_KEY(要在任意目录启动,key 放 ~/.coding_agent/.env)
 
 python -m codingagent          # 交互式终端(类 Claude Code)
 python -m codingagent run "任务"  # 一次性任务
 python -m codingagent web      # 网页端 http://127.0.0.1:8787
+python -m codingagent -w D:\另一个项目 web   # 处理其它目录的项目
 python -m codingagent doctor   # 环境自检
 ```
 
