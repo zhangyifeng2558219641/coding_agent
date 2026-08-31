@@ -24,7 +24,7 @@ permissions:
   sandbox: true                         # 工作区沙箱:默认只允许工作区内操作
   allow_tools: []                       # 直接放行的工具
   deny_tools: []                        # 直接拒绝的工具
-  ask_tools: []                         # 强制确认的工具
+  ask_tools: [WebSearch]                # 强制确认的工具(联网搜索默认需确认,想放行移入 allow_tools)
   allow_commands: []                    # 正则:自动放行的命令
   dangerous_commands:
     - "rm\\s+-rf"
@@ -53,6 +53,13 @@ memory:
   enabled: true
   project_file: .coding_agent/memory/project.md
   user_file: ~/.coding_agent/memory/user.md
+
+# 联网搜索(WebSearch 工具,无 key 抓取 Bing)
+search:
+  base_url: https://www.bing.com/search   # 也可换 https://cn.bing.com/search
+  timeout: 15
+  max_results: 5                          # 单次默认返回条数(上限 10)
+  proxy: null                             # 代理,形如 http://127.0.0.1:7890
 
 skills:
   dirs:

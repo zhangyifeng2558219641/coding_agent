@@ -50,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sandbox": True,             # 工作区沙箱:文件/命令默认限制在工作区根目录内
         "allow_tools": [],           # 直接放行的工具名
         "deny_tools": [],            # 直接拒绝的工具名
-        "ask_tools": [],             # 强制确认的工具名
+        "ask_tools": ["WebSearch"],  # 强制确认的工具名(联网搜索默认需确认)
         "allow_commands": [],        # 正则:自动放行的 shell 命令
         "dangerous_commands": [      # 正则:危险命令,默认需要确认
             r"rm\s+-rf",
@@ -82,6 +82,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "project_file": ".coding_agent/memory/project.md",
         "user_file": "~/.coding_agent/memory/user.md",
+    },
+    "search": {
+        "base_url": "https://www.bing.com/search",   # 无 key 抓取 Bing;可换 cn.bing.com
+        "timeout": 15,
+        "max_results": 5,                            # 单次默认返回条数(上限 10)
+        "proxy": None,                               # 代理,如 http://127.0.0.1:7890
     },
     "skills": {
         "dirs": [

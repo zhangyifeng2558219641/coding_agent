@@ -19,7 +19,7 @@ python -m codingagent doctor   # 环境自检
 ## 特性
 
 - **双端交互**:rich 终端(流式、多行、斜杠命令)+ FastAPI 网页端(对话管理、SSE 流式),共用同一套 Agent 核心
-- **6 大核心工具**:ReadFile / WriteFile / EditFile(严格差异编辑)/ Bash / Glob / Grep
+- **7 大核心工具**:ReadFile / WriteFile / EditFile(严格差异编辑)/ Bash / Glob / Grep / WebSearch(联网搜索)
 - **5 层纵深权限**:危险命令确认、敏感路径拦截、工作区沙箱、白名单、审批模式
 - **扩展系统**:MCP 协议、Skill 技能包、斜杠命令、生命周期钩子、跨会话记忆、SubAgent、Git Worktree、Agent Teams
 - **上下文压缩 + Token 管理**:超预算自动摘要历史
@@ -34,5 +34,5 @@ python -m codingagent doctor   # 环境自检
 ## 测试
 
 ```bash
-python -m pytest tests/ -q   # 42 个用例,mock LLM,免真实 API key
+python -m pytest tests/ -q   # 64 个用例,mock LLM,免真实 API key
 ```

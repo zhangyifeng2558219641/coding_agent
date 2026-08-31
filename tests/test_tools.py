@@ -57,7 +57,7 @@ def test_registry():
     reg = default_registry(with_memory=True, with_agent_tools=True)
     names = reg.names()
     for n in ["ReadFile", "WriteFile", "EditFile", "Bash", "Glob", "Grep",
-              "MemoryRecall", "MemorySave", "DispatchTask"]:
+              "WebSearch", "MemoryRecall", "MemorySave", "DispatchTask"]:
         assert n in names, n
     schemas = reg.schemas()
     assert all(s["type"] == "function" for s in schemas)
