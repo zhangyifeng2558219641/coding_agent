@@ -343,7 +343,7 @@ _INDEX_HTML = """<!DOCTYPE html>
                  font-size:14px; line-height:1.55; }
   .msg.user { text-align:right; }
   .msg.user .bubble { background:var(--accent); color:var(--on-accent); display:inline-block; text-align:left; }
-  .msg.assistant .bubble { background:var(--panel); border:1px solid var(--border); }
+  .msg.assistant .bubble { background:var(--panel); border:1px solid var(--border); white-space:normal; }
   .msg.system .bubble { background:transparent; color:var(--dim); text-align:center; font-size:12px; }
   .toolcard { margin-top:8px; border:1px solid var(--border); border-left:3px solid var(--accent);
               border-radius:8px; overflow:hidden; font-size:12px; }
@@ -365,6 +365,25 @@ _INDEX_HTML = """<!DOCTYPE html>
   .badge { padding:2px 8px; border-radius:10px; font-size:11px; }
   .badge.ok { background:rgba(61,220,132,.15); color:var(--ok); }
   .badge.err { background:rgba(255,107,107,.15); color:var(--err); }
+  /* ---- Markdown 渲染(assistant 气泡)+ 代码高亮 ---- */
+  .msg.assistant .bubble p { margin:0 0 8px; } .msg.assistant .bubble p:last-child { margin-bottom:0; }
+  .msg.assistant .bubble h1,.msg.assistant .bubble h2,.msg.assistant .bubble h3,.msg.assistant .bubble h4 { margin:10px 0 6px; line-height:1.3; }
+  .msg.assistant .bubble ul,.msg.assistant .bubble ol { margin:0 0 8px 20px; }
+  .msg.assistant .bubble li { margin:2px 0; }
+  .msg.assistant .bubble blockquote { margin:6px 0; padding:2px 10px; border-left:3px solid var(--accent); color:var(--dim); }
+  .msg.assistant .bubble a { color:var(--accent); text-decoration:none; } .msg.assistant .bubble a:hover { text-decoration:underline; }
+  .msg.assistant .bubble hr { border:none; border-top:1px solid var(--border); margin:10px 0; }
+  .msg.assistant .bubble code { font-family:Consolas,"Courier New",monospace; }
+  .msg.assistant .bubble :not(pre) > code { background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:12.5px; color:var(--accent); }
+  .msg.assistant .bubble pre.code { background:var(--panel2); border:1px solid var(--border); border-radius:8px; margin:8px 0; overflow:hidden; }
+  .msg.assistant .bubble pre.code .code-head { padding:4px 10px; font-size:11px; color:var(--dim); background:var(--panel); border-bottom:1px solid var(--border); }
+  .msg.assistant .bubble pre.code code { display:block; padding:10px 12px; overflow-x:auto; font-family:Consolas,"Courier New",monospace; font-size:12.5px; line-height:1.55; white-space:pre; }
+  .tok-kw{color:#c678dd;} .tok-s{color:#98c379;} .tok-n{color:#d19a66;} .tok-c{color:#7a8194;font-style:italic;} .tok-fn{color:#61afef;} .tok-de{color:#e5c07b;}
+  html[data-theme="light"] .tok-kw{color:#8250df;} html[data-theme="light"] .tok-s{color:#1a7f37;}
+  html[data-theme="light"] .tok-n{color:#9a6700;} html[data-theme="light"] .tok-c{color:#6e7781;}
+  html[data-theme="light"] .tok-fn{color:#0550ae;} html[data-theme="light"] .tok-de{color:#953800;}
+  html[data-theme="warm"] .tok-kw{color:#7a3d8f;} html[data-theme="warm"] .tok-s{color:#3f6d2e;}
+  html[data-theme="warm"] .tok-n{color:#8a5a1a;} html[data-theme="warm"] .tok-c{color:#8a8378;}
 </style>
 </head>
 <body>
@@ -452,11 +471,139 @@ async function newConv() {
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
+// ---- 自写 Markdown 渲染 + 代码高亮(零外部依赖;所有文本先转义,杜绝注入) ----
+function mdEscape(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+const MD_LANG_TAGS = { python:"py", py:"py", javascript:"js", js:"js", typescript:"ts", ts:"ts",
+  json:"json", yaml:"yaml", yml:"yaml", bash:"bash", sh:"bash", shell:"bash",
+  sql:"sql", html:"html", xml:"html", css:"css", diff:"diff", text:"text", plaintext:"text" };
+const MD_KEYWORDS = new Set(["def","class","import","from","return","if","elif","else","for","while",
+  "try","except","finally","with","as","pass","break","continue","lambda","yield","global","nonlocal",
+  "assert","raise","async","await","function","const","let","var","new","typeof","instanceof",
+  "true","false","null","undefined","and","or","not","in","is","None","True","False","this","self",
+  "export","default","interface","type","extends","implements","enum","switch","case","do","void",
+  "public","private","protected","static","final","int","float","double","bool","str","list","dict",
+  "tuple","set","print","declare","namespace","using"]);
+function mdHighlight(codeEsc, lang) {
+  if (!MD_LANG_TAGS[lang]) return codeEsc;
+  const out = []; let i = 0, n = codeEsc.length;
+  const isId = ch => /[A-Za-z0-9_]/.test(ch);
+  while (i < n) {
+    const c = codeEsc[i];
+    if (c === '#') {
+      let j = i; while (j < n && codeEsc[j] !== "\\n") j++;
+      out.push('<span class="tok-c">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (codeEsc.startsWith('//', i)) {
+      let j = i; while (j < n && codeEsc[j] !== "\\n") j++;
+      out.push('<span class="tok-c">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (codeEsc.startsWith('/*', i)) {
+      let j = codeEsc.indexOf('*/', i + 2); if (j < 0) j = n; else j += 2;
+      out.push('<span class="tok-c">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1; while (j < n && codeEsc[j] !== c && codeEsc[j] !== "\\n") j++;
+      if (j < n && codeEsc[j] === c) j++;
+      out.push('<span class="tok-s">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (c === '@') {
+      let j = i + 1; while (j < n && isId(codeEsc[j])) j++;
+      out.push('<span class="tok-de">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (c >= '0' && c <= '9') {
+      let j = i; while (j < n && /[0-9A-Fa-f_.xX]/.test(codeEsc[j])) j++;
+      out.push('<span class="tok-n">' + codeEsc.slice(i, j) + '</span>'); i = j; continue;
+    }
+    if (isId(c)) {
+      let j = i; while (j < n && isId(codeEsc[j])) j++;
+      const word = codeEsc.slice(i, j);
+      if (MD_KEYWORDS.has(word)) out.push('<span class="tok-kw">' + word + '</span>');
+      else if (codeEsc[j] === '(') out.push('<span class="tok-fn">' + word + '</span>');
+      else out.push(word);
+      i = j; continue;
+    }
+    out.push(c); i++;
+  }
+  return out.join('');
+}
+function mdInline(s) {
+  const esc = mdEscape(s);
+  const parts = esc.split(/`([^`\\n]+)`/);
+  return parts.map((p, i) => {
+    if (i % 2 === 1) return '<code>' + p + '</code>';
+    p = p.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (m, txt, url) => {
+      const u = url.replace(/["'<>]/g, "");
+      if (!/^(https?:|mailto:|#)/i.test(u)) return m;
+      return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + mdEscape(txt) + '</a>';
+    });
+    p = p.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+    p = p.replace(/(^|[^\\w*])\\*([^*\\n]+)\\*(?=[^\\w*]|$)/g, '$1<em>$2</em>');
+    return p;
+  }).join('');
+}
+function mdRender(text) {
+  const src = String(text || "").replace(/\\r\\n/g, "\\n");
+  const lines = src.split("\\n");
+  const html = [];
+  let inCode = false, codeLang = "", codeBuf = [], para = [], listType = "", listBuf = [];
+  const flushList = () => {
+    if (listBuf.length) {
+      const tag = listType === "ol" ? "ol" : "ul";
+      html.push("<" + tag + ">" + listBuf.map(x => "<li>" + x + "</li>").join("") + "</" + tag + ">");
+      listBuf = []; listType = "";
+    }
+  };
+  const flushPara = () => {
+    if (para.length) { html.push("<p>" + para.map(mdInline).join("<br>") + "</p>"); para = []; }
+  };
+  const flushCode = () => {
+    if (inCode) {
+      const tag = MD_LANG_TAGS[codeLang] || "text";
+      const esc = mdEscape(codeBuf.join("\\n"));
+      html.push('<pre class="code"><div class="code-head">' + mdEscape(codeLang || tag) + '</div><code>' + mdHighlight(esc, codeLang) + '</code></pre>');
+      codeBuf = []; codeLang = ""; inCode = false;
+    }
+  };
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    const fence = line.match(/^\\s*(`{3,}|~{3,})\\s*([\\w+-]*)\\s*$/);
+    if (fence) {
+      if (!inCode) { flushPara(); flushList(); inCode = true; codeLang = fence[2]; codeBuf = []; }
+      else { flushCode(); }
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const trimmed = line.trim();
+    if (!trimmed) { flushPara(); flushList(); continue; }
+    const h = line.match(/^(#{1,4})\\s+(.*)$/);
+    if (h) { flushPara(); flushList(); const lvl = h[1].length; html.push("<h" + lvl + ">" + mdInline(h[2]) + "</h" + lvl + ">"); continue; }
+    if (/^(-{3,}|\\*{3,}|_{3,})$/.test(trimmed)) { flushPara(); flushList(); html.push("<hr>"); continue; }
+    if (trimmed.startsWith(">")) {
+      flushPara(); flushList();
+      html.push("<blockquote>" + mdInline(line.replace(/^\\s*>\\s?/, "")) + "</blockquote>");
+      continue;
+    }
+    const li = line.match(/^\\s*([-*+]|\\d+\\.)\\s+(.*)$/);
+    if (li) {
+      const typ = li[1].match(/\\d+/) ? "ol" : "ul";
+      if (listType !== typ) { flushList(); listType = typ; }
+      listBuf.push(mdInline(li[2]));
+      continue;
+    }
+    flushList();
+    para.push(line);
+  }
+  flushCode(); flushPara(); flushList();
+  return html.join("\\n");
+}
+
 function addMsg(role, text) {
   const m = document.createElement("div");
   m.className = "msg " + role;
   const b = document.createElement("div"); b.className = "bubble";
-  b.textContent = text; m.appendChild(b);
+  if (role === "assistant") b.innerHTML = mdRender(text);
+  else b.textContent = text;
+  m.appendChild(b);
   $("messages").appendChild(m);
   $("messages").scrollTop = $("messages").scrollHeight;
   return m;
@@ -504,7 +651,7 @@ function parseSSE(data) {
 // 关键:文本增量先攒进 pending,用 requestAnimationFrame 每帧批量刷一次 DOM 并滚动,
 // 否则团队并行流式时逐 token 渲染会把页面拖死(浏览器提示"页面无响应")。
 let currentMsg = null, currentBubble = null, roundStart = false;
-let pendingDelta = "", pendingBubble = null, flushScheduled = false;
+let pendingBubble = null, flushScheduled = false;
 function clearCursor() {
   if (currentBubble) { const c = currentBubble.querySelector(".cursor"); if (c) c.remove(); }
 }
@@ -513,6 +660,7 @@ function ensureAssistantBubble(forceNew) {
     clearCursor();
     currentMsg = addMsg("assistant", "");
     currentBubble = currentMsg.querySelector(".bubble");
+    currentBubble._md = "";
     roundStart = false;
   }
   return currentBubble;
@@ -524,13 +672,13 @@ function scheduleFlush() {
 }
 function flushPending() {
   flushScheduled = false;
-  if (pendingDelta && pendingBubble) {
+  if (pendingBubble) {
     const c = pendingBubble.querySelector(".cursor"); if (c) c.remove();
-    pendingBubble.textContent += pendingDelta;
-    pendingDelta = "";
+    // 流式下每帧对累积原文整体重渲染 Markdown,保证代码块/标题等随增量实时成形
+    pendingBubble.innerHTML = mdRender(pendingBubble._md || "");
     const cursor = document.createElement("span"); cursor.className="cursor"; pendingBubble.appendChild(cursor);
+    pendingBubble = null;
   }
-  pendingBubble = null;
   const wrap = $("messages");
   wrap.scrollTop = wrap.scrollHeight;
 }
@@ -542,7 +690,7 @@ async function send() {
   $("input").value = ""; state.busy = true; $("send").disabled = true;
   addMsg("user", text);
   currentMsg = null; currentBubble = null; roundStart = false;
-  pendingDelta = ""; pendingBubble = null;
+  pendingBubble = null;
   const wrap = $("messages");
   let buf = "";
   try {
@@ -561,7 +709,7 @@ async function send() {
       }
     }
   } catch(e) {
-    ensureAssistantBubble().textContent += "\\n请求失败: " + e.message;
+    ensureAssistantBubble(); currentBubble._md += "\\n请求失败: " + e.message; scheduleFlush();
   }
   clearCursor(); state.busy = false; $("send").disabled = false;
 }
@@ -570,13 +718,13 @@ function handleEvent(ev, wrap) {
   let d; try { d = JSON.parse(ev.data); } catch { d = {}; }
   switch (ev.event) {
     case "text": {
-      pendingDelta += (d.delta || "");
       pendingBubble = ensureAssistantBubble();
+      pendingBubble._md += (d.delta || "");
       scheduleFlush();
       break; }
     case "tool_call":
       ensureAssistantBubble();
-      if (!currentBubble.textContent.trim()) currentBubble.textContent = "(调用工具)";
+      if (!currentBubble._md.trim()) currentBubble._md = "(调用工具)";
       addToolCard(currentMsg, d.name, JSON.stringify(d.arguments||{}), "", d.status);
       clearCursor();
       break;
@@ -590,7 +738,7 @@ function handleEvent(ev, wrap) {
                      const s = document.createElement("div");
                      s.className="msg system"; s.innerHTML=`<div class="bubble">${esc(d.message||"")}</div>`;
                      wrap.appendChild(s); wrap.scrollTop = wrap.scrollHeight; break; }
-    case "error": ensureAssistantBubble().textContent += "\\n✗ " + (d.message || ""); break;
+    case "error": ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
     case "done": refreshList(); break;
   }
   scheduleFlush();
@@ -614,14 +762,15 @@ $("themeSelect").onchange = e => applyTheme(e.target.value);
 async function sendSlash(cmd) {
   if (!state.cur) await newConv();
   addMsg("user", cmd);
-  const bubble = addMsg("assistant", "");
+  const msg = addMsg("assistant", "");
+  const bub = msg.querySelector(".bubble"); bub._md = "";
   const r = await fetch("/api/chat", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({conversation_id: state.cur, message: cmd})});
   const reader = r.body.getReader(); const dec = new TextDecoder(); let buf="";
   while (true) { const {done,value}=await reader.read(); if(done) break;
     buf += dec.decode(value,{stream:true}); let i;
     while((i=buf.indexOf("\\n\\n"))!==-1){const bl=buf.slice(0,i);buf=buf.slice(i+2);
-      for(const ev of parseSSE(bl)){if(ev.event==="text"){let d=JSON.parse(ev.data);bubble.textContent+=d.delta||"";}}} }
+      for(const ev of parseSSE(bl)){if(ev.event==="text"){let d=JSON.parse(ev.data);bub._md+=d.delta||"";bub.innerHTML=mdRender(bub._md);}}} }
 }
 async function init() {
   let saved = "dark";
