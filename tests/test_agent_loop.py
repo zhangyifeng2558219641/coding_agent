@@ -220,3 +220,26 @@ def test_history_compact(workspace: Path):
     assert h.summary
     assert len(h.messages) <= 12  # KEEP_RECENT
     assert h.system_prompt()  # 摘要已并入 system
+
+
+def test_loop_retries_empty_response(workspace: Path):
+    """模型首轮返回空响应(无文本且无工具调用)应自动重试,而非直接报错。"""
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("", []),            # 第一轮空响应 → 触发重试
+        ("终于有输出了", []),
+    ])
+    result = agent.run("测试")
+    assert result.success
+    assert "终于有输出了" in result.text
+
+
+def test_loop_empty_response_exhausts_retries(workspace: Path):
+    """空响应重试耗尽后仍显式上报错误,不会无限循环。"""
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("", []), ("", []), ("", []), ("", []),
+    ])
+    result = agent.run("测试")
+    assert not result.success
+    assert "空响应" in result.error

@@ -20,6 +20,10 @@ from ..tools import ToolRegistry
 from .permissions import PermissionPolicy
 from .subagent import SubAgent
 
+# 每位成员产出在负责人汇总 prompt 中的字符上限:多成员产出拼起来很容易超出模型
+# 上下文/让模型返回空响应,先截断再汇总。
+LEADER_MEMBER_MAX = 3000
+
 
 @dataclass
 class TeamMember:
@@ -49,6 +53,19 @@ class TeamResult:
     members: list[dict[str, Any]] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     error: str = ""
+    saved_to: str = ""  # 负责人汇总成果写入的文件路径(空表示未写)
+
+
+def _member_digest(task: str, outputs: list[dict[str, Any]]) -> str:
+    """负责人汇总失败时的兜底:把各成员产出整理成可读摘要返回,避免用户只看到一句错误。"""
+    blocks = [f"原始任务: {task}", ""]
+    for o in outputs:
+        state = "成功" if o["success"] else f"失败({o['error']})"
+        text = o["text"] or "(无输出)"
+        if len(text) > LEADER_MEMBER_MAX:
+            text = text[:LEADER_MEMBER_MAX] + f"\n…(已截断,共 {len(text)} 字符)"
+        blocks.append(f"## 成员 {o['name']}({o['role']}) - {state}\n{text}")
+    return "\n\n".join(blocks)
 
 
 class Team:
@@ -92,11 +109,22 @@ class Team:
             if m.model and m.model != self.config.provider.get("model"):
                 client = client_from_config(self.config)
                 client.model = m.model
+            if ui:
+                ui.event("status", {"message": f"成员「{m.name}」({m.role}) 开始处理…"})
+            # 成员静默执行(ui=None):不把逐 token 的推理/工具过程实时泄漏到聊天,
+            # 否则多名成员并行会把各自的"第 N 轮推理"等事件交织在一起,阅读顺序混乱。
+            # 只在开始/结束时各发一条状态,最终成果由负责人统一汇总后一次性给出。
             sub = SubAgent(self.config, self.workspace, client, self.registry,
                            name=m.name, system_prompt=m.role_prompt(),
                            allow_tools=m.allow_tools,
-                           permissions=self.permissions, ui=ui)
+                           permissions=self.permissions, ui=None)
             r = sub.run(task)
+            if ui:
+                state = "成功" if r.success else f"失败({r.error})"
+                tail = (r.text or "").strip().replace("\n", " ")
+                if len(tail) > 50:
+                    tail = tail[:50] + "…"
+                ui.event("status", {"message": f"成员「{m.name}」({m.role}) {state}: {tail}"})
             return {"name": m.name, "role": m.role, "text": r.text,
                     "success": r.success, "usage": r.usage, "error": r.error}
 
@@ -108,23 +136,40 @@ class Team:
                 usage += out["usage"]
         member_outputs.sort(key=lambda o: [m.name for m in self.members].index(o["name"]))
 
-        # 负责人汇总
+        # 负责人汇总:prompt 已截断,空响应/异常重试一次(多为瞬时),仍失败则兜底展示成员产出
         if ui:
             ui.event("status", {"message": f"负责人正在汇总 {len(member_outputs)} 份成员产出…"})
         summary_prompt = self._leader_prompt(task, member_outputs)
-        try:
-            resp = self.client.chat([{"role": "user", "content": summary_prompt}],
-                                    max_tokens=2048)
-            final_text = resp.content
-            usage += resp.usage
-            success = bool(final_text.strip())
-            error = ""
-        except LLMError as e:
-            final_text = ""
-            success = False
-            error = str(e)
+        final_text, error = "", ""
+        for attempt in range(2):
+            try:
+                resp = self.client.chat([{"role": "user", "content": summary_prompt}],
+                                        max_tokens=2048)
+                usage += resp.usage
+                final_text = resp.content or ""
+            except LLMError as e:
+                error = str(e)
+                final_text = ""
+            if final_text.strip():
+                error = ""
+                break
+            if attempt == 0:
+                if not error:
+                    error = "模型返回了空响应"
+                continue
+        success = bool(final_text.strip())
+        saved_to = ""
+        if not success:
+            final_text = _member_digest(task, member_outputs)
+            error = f"负责人汇总失败({error or '模型返回了空响应'}),已改为展示成员产出原文。"
+        else:
+            # 负责人汇总成果统一写入工作区一份文档,作为唯一权威交付物
+            # (成员已被配置为只输出文本、不各自写文件)。
+            out = self.workspace / f"{self.name}_汇总.md"
+            out.write_text(final_text, encoding="utf-8")
+            saved_to = str(out)
 
-        result = TeamResult(final_text=final_text, success=success,
+        result = TeamResult(final_text=final_text, success=success, saved_to=saved_to,
                             members=[{k: v for k, v in o.items() if k != "usage"}
                                      for o in member_outputs],
                             usage=usage, error=error)
@@ -142,6 +187,9 @@ class Team:
         blocks = []
         for o in outputs:
             state = "成功" if o["success"] else f"失败({o['error']})"
-            blocks.append(f"【成员 {o['name']}({o['role']})-{state}】\n{o['text']}")
+            text = o["text"] or ""
+            if len(text) > LEADER_MEMBER_MAX:
+                text = text[:LEADER_MEMBER_MAX] + f"\n…(已截断,共 {len(text)} 字符)"
+            blocks.append(f"【成员 {o['name']}({o['role']})-{state}】\n{text}")
         body = "\n\n".join(blocks)
         return f"{self.leader_prompt}\n\n原始任务:\n{task}\n\n成员产出:\n{body}\n\n请输出最终成果:"

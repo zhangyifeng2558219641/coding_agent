@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -39,6 +40,21 @@ def run(coro):
 
 def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+def sse_events(text: str) -> list[tuple[str, str]]:
+    """把 SSE 响应体解析成 [(event_type, data), ...]。"""
+    out = []
+    for block in text.split("\n\n"):
+        e, data = None, []
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                e = line[6:].strip()
+            elif line.startswith("data:"):
+                data.append(line[5:].strip())
+        if e:
+            out.append((e, "\n".join(data)))
+    return out
 
 
 def test_web_health_and_config(tmp_path: Path):
@@ -125,11 +141,17 @@ def test_web_slash_team_streams_status(tmp_path: Path):
             r = await c.post("/api/chat",
                              json={"conversation_id": cid,
                                    "message": "/team demo-team 完成一次计划"})
-            assert "event: status" in r.text
+            evs = sse_events(r.text)
+            statuses = [json.loads(d).get("message", "") for e, d in evs if e == "status"]
             assert "开始并行作业" in r.text
+            assert any("开始处理" in s for s in statuses)     # 成员开始状态
+            assert any("成功" in s and "成员A" in s for s in statuses)  # 成员完成状态
             assert "负责人正在汇总" in r.text
             assert "(mock 摘要)" in r.text  # 负责人汇总产出
             assert "done" in r.text
+            # 成员原始推理不再作为 text 流泄漏(静默执行,避免多成员输出交织)
+            texts = [json.loads(d).get("delta", "") for e, d in evs if e == "text"]
+            assert not any("成员完成" in t for t in texts)
 
     run(go())
 

@@ -129,6 +129,7 @@ class AgentLoop:
         final_text = ""
         last_error = ""
         iterations = 0
+        empty_retries = 0
 
         try:
             while iterations < self.options.max_iterations:
@@ -171,6 +172,9 @@ class AgentLoop:
                 if not calls:
                     # 没有工具调用 → 输出最终答复,循环终止
                     if not text.strip():
+                        if empty_retries < 2:
+                            empty_retries += 1
+                            continue  # 空响应多为瞬时,重试(不写回历史)
                         last_error = "模型返回了空响应(无文本且无工具调用)"
                     self.history.append({"role": "assistant", "content": text})
                     break

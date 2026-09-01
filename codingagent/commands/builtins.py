@@ -140,7 +140,10 @@ def _team(ctx, args: str) -> str:
     team = Team(name, members, ctx.config, ctx.workspace, ctx.agent.client,
                 ctx.registry, permissions=ctx.agent.permissions, ui=ctx.agent.ui)
     r = team.run(task)
-    return r.final_text or r.error or "(空结果)"
+    text = r.final_text or r.error or "(空结果)"
+    if r.saved_to:
+        text += f"\n\n> 汇总文档已写入: {r.saved_to}"
+    return text
 
 
 def _worktree(ctx, args: str) -> str:
