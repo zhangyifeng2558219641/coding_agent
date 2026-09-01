@@ -216,9 +216,111 @@ async def _coalesce(queue: asyncio.Queue, alive) -> Any:
         yield "text", {"delta": "".join(pending)}
 
 
+_TITLE_PREFIXES = [
+    "请帮我写", "请帮我", "请给我", "麻烦你", "请你帮我",
+    "帮我写", "帮我生成", "帮我实现", "帮我修复", "帮我做", "帮我看看",
+    "帮我读", "帮我改", "帮我找", "帮我查", "帮我解释", "帮我总结", "帮我分析", "帮我检查", "帮我",
+    "请你", "麻烦", "请",
+    "能不能", "能否", "可否", "你能", "你可以",
+    "我需要", "我想", "我要", "我想要",
+    "写一个", "写个", "写一段", "写一份",
+    "实现一个", "生成一个", "创建一个", "做一个", "实现", "生成", "创建", "做",
+    "阅读", "读取", "读一下", "看看", "查看", "检查", "分析", "总结", "解释一下", "解释",
+    "修复一下", "修复", "添加", "新增", "优化", "重构", "测试", "调试", "删除", "移除", "修改",
+    "把", "给", "让", "将",
+    "一个", "这个", "那个",
+]
+
+
 def _default_title(message: str) -> str:
-    msg = message.strip().replace("\n", " ")
-    return msg[:24] + ("…" if len(msg) > 24 else "")
+    """从首条消息提取核心内容作标题:去祈使前缀/代码块、按句读断句、限长。"""
+    msg = (message or "").strip()
+    if not msg:
+        return "新会话"
+    # 代码块:取第一行非空内容(代码保留括号/引号,不做标点剥离)
+    if msg.startswith("```"):
+        lines = [l.strip() for l in msg.splitlines()
+                 if l.strip() and not l.strip().startswith("```")]
+        msg = lines[0] if lines else "代码片段"
+        from_code = True
+    else:
+        msg = msg.replace("\n", " ").strip()
+        from_code = False
+    # 反复剥离祈使前缀(长前缀优先,直到不再变化)
+    changed = True
+    while changed and msg:
+        changed = False
+        low = msg.lower()
+        for p in _TITLE_PREFIXES:
+            if low.startswith(p):
+                msg = msg[len(p):].strip()
+                changed = True
+                break
+    # 去掉首尾标点/中文引号(代码内容原样保留)
+    if not from_code:
+        msg = msg.strip(" \t“”‘’「」『』〈〉《》()（）[]【】,，。！？!?;；:：、")
+    # 优先取第一个句末标点前的完整分句
+    for sep in "。！？!?\n":
+        if sep in msg:
+            msg = msg.split(sep, 1)[0]
+            break
+    # 超长时优先在逗号处断,否则按字截断
+    if len(msg) > 24:
+        cut = msg.find("，")
+        if 0 < cut <= 24:
+            msg = msg[:cut]
+    if len(msg) > 24:
+        msg = msg[:24].rstrip() + "…"
+    return msg or "新会话"
+
+
+_TITLE_SYSTEM = (
+    "把下面的用户消息概括成一个不超过20字的简短中文标题,只输出标题本身,"
+    "不要引号、不要多余标点。"
+)
+
+
+def _llm_title(client, message: str) -> str:
+    """用模型把首条消息总结成标题;任何失败/非法输出都返回空串(回退启发式)。"""
+    try:
+        resp = client.chat([
+            {"role": "system", "content": _TITLE_SYSTEM},
+            {"role": "user", "content": (message or "")[:500]},
+        ])
+        title = (resp.content or "").strip().strip("“”\"'《》。，, ")
+        if not title or len(title) > 24:
+            return ""
+        return title
+    except Exception:
+        return ""
+
+
+def _title_client(session) -> Any:
+    """标题精修用的轻量客户端:短超时、单次重试、小 max_tokens。"""
+    from ..llm import ChatClient
+    p = session.config.provider
+    return ChatClient(
+        base_url=p.get("base_url", "https://api.deepseek.com"),
+        api_key=session.config.api_key(),
+        model=p.get("model", "deepseek-chat"),
+        temperature=0.3,
+        max_tokens=256,
+        timeout=10,
+        max_retries=1,
+        include_usage=False,
+    )
+
+
+def _refine_title(store, client, cid: str, message: str, auto_title: Optional[str]) -> None:
+    """首条消息完成后,用模型把自动标题精修为核心内容;用户已改过则不覆盖。"""
+    if not auto_title:
+        return
+    title = _llm_title(client, message)
+    if not title:
+        return
+    cur = store.get(cid)
+    if cur and cur["title"] == auto_title:
+        store.touch(cid, title)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +454,16 @@ def create_app(session: Session) -> FastAPI:
     def delete_conversation(cid: str):
         return {"ok": store.delete(cid)}
 
+    @app.post("/api/conversations/{cid}/rename")
+    def rename_conversation(cid: str, payload: dict):
+        if store.get(cid) is None:
+            raise HTTPException(404, "会话不存在")
+        title = ((payload or {}).get("title") or "").strip()
+        if not title:
+            return {"ok": False, "error": "标题为空"}
+        store.touch(cid, title)
+        return {"ok": True}
+
     @app.post("/api/chat")
     async def chat(body: ChatBody):
         if not body.message.strip():
@@ -359,8 +471,10 @@ def create_app(session: Session) -> FastAPI:
         meta = store.get(body.conversation_id)
         if not meta:
             meta = store.create()
+        auto_title = None
         if not meta["title"] or meta["title"] == "新会话":
-            store.touch(body.conversation_id, _default_title(body.message))
+            auto_title = _default_title(body.message)
+            store.touch(body.conversation_id, auto_title)
 
         # 装载/恢复该会话的独立历史(新会话新建,互不共享)
         history = session.load_history(body.conversation_id)
@@ -429,6 +543,10 @@ def create_app(session: Session) -> FastAPI:
                     agent.client.model = body.model
                 result_holder["result"] = agent.run(body.message)
                 session.save_history(history, body.conversation_id)
+                # 首条消息自动标题:用模型精修为核心内容(无 key/离线时保持启发式标题)
+                if auto_title:
+                    _refine_title(store, _title_client(session), body.conversation_id,
+                                  body.message, auto_title)
             except Exception as e:  # pragma: no cover
                 result_holder["error"] = str(e)
             finally:
@@ -556,6 +674,8 @@ _INDEX_HTML = """<!DOCTYPE html>
             border:1px solid var(--border); border-radius:8px; font-size:12px; outline:none; box-sizing:border-box; }
   #search:focus { border-color:var(--accent); }
   #search::placeholder { color:var(--dim); }
+  .rename-input { width:100%; box-sizing:border-box; padding:2px 6px; font-size:12px; color:var(--text);
+                  background:var(--panel2); border:1px solid var(--accent); border-radius:4px; outline:none; }
   #convList { flex:1; overflow-y:auto; }
   .conv { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px;
           color:var(--dim); display:flex; justify-content:space-between; align-items:center; }
@@ -728,7 +848,7 @@ _INDEX_HTML = """<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 let state = { convs: [], cur: null, busy: false, permMode: "interactive", search: "",
-              resendAt: null, turnOk: false, isSlash: false };
+              resendAt: null, turnOk: false, isSlash: false, renamingId: null };
 let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
 let slashCommands = [], slashOpen = false, slashIndex = 0, slashItems = [];
 let askQueue = [];  // 待审批确认的 FIFO 队列(团队并行可能多个 pending)
@@ -752,11 +872,13 @@ async function refreshList() {
   renderConvList();
 }
 function renderConvList() {
+  if (state.renamingId) return;  // 重命名中不重建列表,避免内联输入框被刷新抹掉
   const list = $("convList"); list.innerHTML = "";
   const q = (state.search || "").trim().toLowerCase();
   state.convs.filter(c => !q || (c.title || "").toLowerCase().includes(q)).forEach(c => {
     const div = document.createElement("div");
     div.className = "conv" + (c.id === state.cur ? " active" : "");
+    div.dataset.id = c.id;
     div.innerHTML = `<span class="t">${esc(c.title)}</span><button class="del">✕</button>`;
     div.onclick = () => openConv(c.id);
     div.querySelector(".del").onclick = async e => {
@@ -767,6 +889,32 @@ function renderConvList() {
     };
     list.appendChild(div);
   });
+}
+function startRename(cid, convEl) {
+  const t = convEl.querySelector(".t");
+  if (!t) return;
+  const input = document.createElement("input");
+  input.className = "rename-input"; input.type = "text";
+  input.value = t.textContent;
+  t.replaceWith(input);
+  state.renamingId = cid;
+  input.focus(); input.select();
+  let done = false;
+  const finish = async save => {
+    if (done) return; done = true;
+    state.renamingId = null;
+    const val = input.value.trim();
+    if (save && val) {
+      try { await api(`/api/conversations/${cid}/rename`,
+                      {method:"POST", body: JSON.stringify({title: val})}); } catch(e) {}
+    }
+    refreshList();
+  };
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
 }
 async function openConv(id) {
   state.cur = id;
@@ -1299,6 +1447,11 @@ $("chooseText").addEventListener("keydown", e => {
 $("search").addEventListener("input", e => {
   state.search = e.target.value;
   renderConvList();
+});
+$("convList").addEventListener("dblclick", e => {
+  if (e.target.closest(".del")) return;
+  const conv = e.target.closest(".conv");
+  if (conv) startRename(conv.dataset.id, conv);
 });
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };

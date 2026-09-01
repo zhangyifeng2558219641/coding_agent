@@ -174,6 +174,122 @@ def test_web_conversation_crud(tmp_path: Path):
     run(go())
 
 
+def test_web_rename_endpoint(tmp_path: Path):
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "旧标题"})).json()["id"]
+            r = await c.post(f"/api/conversations/{cid}/rename",
+                             json={"title": "新标题"})
+            assert r.json()["ok"] is True
+            assert (await c.get(f"/api/conversations/{cid}")).json()["meta"]["title"] == "新标题"
+            # 空标题拒绝
+            assert (await c.post(f"/api/conversations/{cid}/rename",
+                                 json={"title": "   "})).json()["ok"] is False
+            # 不存在的会话 404
+            assert (await c.post("/api/conversations/nope/rename",
+                                 json={"title": "x"})).status_code == 404
+
+    run(go())
+
+
+def test_web_auto_title_from_first_message(tmp_path: Path):
+    """首条消息自动设标题:提取核心内容而非单纯截取前几字。"""
+    session = make_client_session(tmp_path, [("回复", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "新会话"})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "帮我写一个排序算法"})
+            meta = (await c.get(f"/api/conversations/{cid}")).json()["meta"]
+            assert meta["title"] == "排序算法"
+            assert meta["title"] != "新会话"
+
+    run(go())
+
+
+def test_default_title_extracts_core():
+    """启发式标题提取核心内容:去祈使前缀/代码块、按句读断句、限长。"""
+    from codingagent.ui.web import _default_title
+    assert _default_title("帮我写一个排序算法") == "排序算法"
+    assert _default_title("请阅读 README.md 并总结项目结构") == "README.md 并总结项目结构"
+    assert _default_title("把文件 A 复制到 B") == "文件 A 复制到 B"
+    assert _default_title("```python\nprint('hello')\n```") == "print('hello')"
+    assert _default_title("  ") == "新会话"
+    # 限长:超过 24 字按逗号断,否则截断
+    t = _default_title("帮我写一个很长的用于统计词频的脚本,要求支持中文分词,并输出排序结果")
+    assert len(t) <= 25 and "词频" in t
+
+
+def test_llm_title_from_model():
+    """模型标题:正常返回内容、过长/异常输出回退空串。"""
+    from codingagent.ui.web import _llm_title
+
+    class R:
+        def __init__(self, content):
+            self.content = content
+
+    class OkClient:
+        def chat(self, messages, **kw):
+            return R("排序算法优化")
+
+    assert _llm_title(OkClient(), "帮我写一个排序算法") == "排序算法优化"
+
+    class EmptyClient:
+        def chat(self, messages, **kw):
+            return R("   ")
+
+    assert _llm_title(EmptyClient(), "x") == ""  # 空输出视为失败
+
+    class LongClient:
+        def chat(self, messages, **kw):
+            return R("这是一个非常非常长的标题用来测试超长的情况到底怎么样")
+
+    assert _llm_title(LongClient(), "hi") == ""
+
+    class BadClient:
+        def chat(self, messages, **kw):
+            raise RuntimeError("boom")
+
+    assert _llm_title(BadClient(), "hi") == ""
+
+
+def test_refine_title_updates_auto_only(tmp_path: Path):
+    """模型精修:仅当标题仍是自动标题时覆盖;用户改过/非首条则不动。"""
+    from codingagent.ui.web import _refine_title, ConversationStore
+    from codingagent.config import Config
+
+    class R:
+        def __init__(self, content):
+            self.content = content
+
+    class TitleClient:
+        def chat(self, messages, **kw):
+            return R("语义化新标题")
+
+    cfg = Config({}, tmp_path)
+    store = ConversationStore(cfg.session_store_path())
+    cid = store.create("排序算法")["id"]
+
+    # 标题未被改动 → 精修为模型标题
+    _refine_title(store, TitleClient(), cid, "帮我写排序", "排序算法")
+    assert store.get(cid)["title"] == "语义化新标题"
+
+    # 用户已改名 → 不覆盖
+    cid2 = store.create("排序算法")["id"]
+    store.touch(cid2, "用户改的名字")
+    _refine_title(store, TitleClient(), cid2, "帮我写排序", "排序算法")
+    assert store.get(cid2)["title"] == "用户改的名字"
+
+    # auto_title 为空 → no-op
+    cid3 = store.create("排序算法")["id"]
+    _refine_title(store, TitleClient(), cid3, "hi", None)
+    assert store.get(cid3)["title"] == "排序算法"
+
+
 def test_web_chat_sse_tool_call(tmp_path: Path):
     session = make_client_session(tmp_path, [
         ("我来写文件。", [ToolCall(id="1", name="WriteFile",
@@ -417,7 +533,7 @@ def test_web_import_raw_history(tmp_path: Path):
                 {"role": "assistant", "content": "好的。"},
             ]}
             meta = (await c.post("/api/conversations/import", json=payload)).json()
-            assert meta["title"] == "帮我写一个 hello"
+            assert meta["title"] == "hello"  # 提取核心内容,不再带"帮我写一个"套话
             got = (await c.get(f"/api/conversations/{meta['id']}")).json()
             assert len(got["messages"]) == 2
 
