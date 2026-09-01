@@ -881,3 +881,118 @@ def test_web_chat_resend_at_ignored_invalid(tmp_path: Path):
             assert contents.count("追加") == 2
 
     run(go())
+
+
+# --------------------------------------------------------------------------
+# 文件检查点 / 回滚(Web API)
+# --------------------------------------------------------------------------
+
+
+def test_web_checkpoint_and_rollback(tmp_path: Path):
+    """写文件→检查点 1;改文件→检查点 2;回滚到 1 → 文件还原 + 历史含备注。"""
+    session = make_client_session(tmp_path, [
+        ("先写 out.txt。", [ToolCall(id="1", name="WriteFile",
+                                     arguments={"path": "out.txt", "content": "v1"})]),
+        ("已创建。", []),
+        ("改成 v2。", [ToolCall(id="2", name="EditFile",
+                                arguments={"path": "out.txt", "old_string": "v1",
+                                           "new_string": "v2"})]),
+        ("已修改。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "新会话"})).json()["id"]
+            # 第一轮:写文件
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "创建 out.txt"})
+            cps = (await c.get(f"/api/conversations/{cid}/checkpoints")).json()["checkpoints"]
+            assert len(cps) == 1
+            assert cps[0]["files"]["out.txt"]["after"] == "v1"
+            assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "v1"
+            # 第二轮:改文件
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "改成 v2"})
+            cps = (await c.get(f"/api/conversations/{cid}/checkpoints")).json()["checkpoints"]
+            assert len(cps) == 2
+            assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "v2"
+            # 回滚到检查点 1
+            r = (await c.post(f"/api/conversations/{cid}/rollback",
+                              json={"checkpoint": 1})).json()
+            assert r["ok"] is True
+            assert "out.txt" in r["result"]["restored"]
+            assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "v1"
+            # 历史已写入回滚备注
+            hist = (await c.get(f"/api/conversations/{cid}")).json()["messages"]
+            assert any("回滚" in (m.get("content") or "") for m in hist)
+
+    run(go())
+
+
+def test_web_checkpoints_fresh_and_404(tmp_path: Path):
+    """新会话检查点为空;不存在的会话 /checkpoints 返回 404。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "t"})).json()["id"]
+            assert (await c.get(f"/api/conversations/{cid}/checkpoints")).json()["checkpoints"] == []
+            assert (await c.get("/api/conversations/nope/checkpoints")).status_code == 404
+
+    run(go())
+
+
+def test_web_rollback_bad_seq(tmp_path: Path):
+    """越界检查点序号回滚返回 400。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "t"})).json()["id"]
+            r = await c.post(f"/api/conversations/{cid}/rollback", json={"checkpoint": 5})
+            assert r.status_code == 400
+            r0 = await c.post(f"/api/conversations/{cid}/rollback", json={"checkpoint": 0})
+            assert r0.status_code == 400
+            assert (await c.post("/api/conversations/nope/rollback",
+                                 json={"checkpoint": 1})).status_code == 404
+
+    run(go())
+
+
+def test_web_rollback_while_running(tmp_path: Path):
+    """会话正在生成时回滚返回 409(避免与进行中的写盘冲突)。"""
+    import threading
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "t"})).json()["id"]
+            webmod._RUNNING[cid] = {"agent": None, "stop_event": threading.Event()}
+            try:
+                r = await c.post(f"/api/conversations/{cid}/rollback", json={"checkpoint": 1})
+                assert r.status_code == 409
+            finally:
+                webmod._RUNNING.pop(cid, None)
+
+    run(go())
+
+
+def test_web_checkpoint_delete_cleans_file(tmp_path: Path):
+    """删除会话时连同 .checkpoints.json 一起清理。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "t"})).json()["id"]
+            cps_path = tmp_path / ".coding_agent" / "sessions" / f"{cid}.checkpoints.json"
+            cps_path.parent.mkdir(parents=True, exist_ok=True)
+            cps_path.write_text('{"checkpoints": []}', encoding="utf-8")
+            assert cps_path.exists()
+            assert (await c.delete(f"/api/conversations/{cid}")).json() == {"ok": True}
+            assert not cps_path.exists()
+
+    run(go())

@@ -363,3 +363,146 @@ def test_slash_plan_toggles_mode(workspace: Path):
     assert agent.plan_mode
     reg.run("execute", "", ctx)
     assert not agent.plan_mode
+
+
+# --------------------------------------------------------------------------
+# 文件检查点:WriteFile/EditFile 自动快照,回合末 finalize 成检查点
+# --------------------------------------------------------------------------
+
+
+def test_loop_creates_checkpoint(workspace: Path):
+    from codingagent.agent.checkpoint import CheckpointStore
+    cps = CheckpointStore(workspace / "cps.json")
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("先写文件。", [ToolCall(id="1", name="WriteFile",
+                                 arguments={"path": "hello.txt", "content": "hello agent"})]),
+        ("已创建完成。", []),
+    ], checkpoints=cps)
+    result = agent.run("请创建 hello.txt")
+    assert result.success
+    cps_list = cps.list()
+    assert len(cps_list) == 1
+    assert cps_list[0]["files"]["hello.txt"]["before"] is None
+    assert cps_list[0]["files"]["hello.txt"]["after"] == "hello agent"
+
+
+def test_loop_two_turns_rollback_restores(workspace: Path):
+    """跨轮累计:turn1 写、turn2 改 → 两个检查点;回滚 cp1 还原 turn1 的状态。"""
+    from codingagent.agent.checkpoint import CheckpointStore
+    cps = CheckpointStore(workspace / "cps.json")
+    config = make_config(workspace)
+    a1 = make_agent(config, workspace, script=[
+        ("写文件。", [ToolCall(id="1", name="WriteFile",
+                               arguments={"path": "note.txt", "content": "v1"})]),
+        ("完成。", []),
+    ], checkpoints=cps)
+    a1.run("创建 note.txt")
+    assert len(cps.list()) == 1
+    a2 = make_agent(config, workspace, script=[
+        ("改文件。", [ToolCall(id="1", name="EditFile",
+                               arguments={"path": "note.txt", "old_string": "v1",
+                                          "new_string": "v2"})]),
+        ("完成。", []),
+    ], checkpoints=cps)
+    a2.run("把 v1 改成 v2")
+    assert len(cps.list()) == 2
+    assert (workspace / "note.txt").read_text(encoding="utf-8") == "v2"
+    res = cps.rollback(1, workspace)
+    assert res["restored"] == ["note.txt"]
+    assert (workspace / "note.txt").read_text(encoding="utf-8") == "v1"
+
+
+def test_loop_llm_error_still_finalizes(workspace: Path):
+    """LLM 失败中断的回合,已成功写盘的文件也要 finalize 成检查点。"""
+    from codingagent.agent.checkpoint import CheckpointStore
+    from codingagent.agent.loop import AgentLoop, UISink
+    from codingagent.agent.permissions import PermissionPolicy
+    from codingagent.llm import LLMError
+    from codingagent.tools import default_registry
+
+    class WriteThenFail(MockClient):
+        def __init__(self):
+            self.calls = []
+
+        def chat_stream(self, messages, tools=None, **kw):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                yield StreamEvent(type="text", text="先写文件。")
+                yield StreamEvent(type="tool_calls", calls=[
+                    ToolCall(id="1", name="WriteFile",
+                             arguments={"path": "a.txt", "content": "data"})])
+                yield StreamEvent(type="finish", reason="tool_calls")
+            else:
+                raise LLMError("API 连接失败")
+
+    class RecordingUI(UISink):
+        def __init__(self):
+            self.events = []
+
+        def event(self, type, data):
+            self.events.append((type, data))
+
+    cps = CheckpointStore(workspace / "cps.json")
+    config = make_config(workspace)
+    reg = default_registry(with_memory=True, with_agent_tools=False)
+    agent = AgentLoop(config, workspace, WriteThenFail(), reg,
+                      permissions=PermissionPolicy(config.permissions, workspace),
+                      ui=RecordingUI(), checkpoints=cps)
+    result = agent.run("写个文件")
+    assert not result.success
+    cps_list = cps.list()
+    assert len(cps_list) == 1, "LLM 失败也要把已写盘的内容落成检查点"
+    assert cps_list[0]["files"]["a.txt"]["after"] == "data"
+
+
+def test_checkpoint_skips_self_capture(workspace: Path):
+    """写 .coding_agent/ 自管理文件不产生检查点(避免检查点套娃)。"""
+    from codingagent.agent.checkpoint import CheckpointStore
+    cps = CheckpointStore(workspace / "cps.json")
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("写自定义命令。", [ToolCall(id="1", name="WriteFile",
+                                     arguments={"path": ".coding_agent/commands/foo.md",
+                                                "content": "# test"})]),
+        ("完成。", []),
+    ], checkpoints=cps)
+    result = agent.run("创建自定义命令")
+    assert result.success
+    assert cps.list() == []
+
+
+def test_slash_checkpoint_list_and_rollback(workspace: Path):
+    """/checkpoint 列出检查点;/checkpoint rollback <n> 回滚并写历史备注。"""
+    from types import SimpleNamespace
+    from codingagent.agent.checkpoint import CheckpointStore
+    from codingagent.commands.builtins import register_builtin_commands
+    from codingagent.commands.slash import SlashRegistry
+
+    cps = CheckpointStore(workspace / "cps.json")
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, [])
+    agent.checkpoints = cps
+    # cp1: v0 -> v1
+    (workspace / "a.txt").write_text("v0", encoding="utf-8")
+    cps.snapshot_before(workspace, "a.txt")
+    (workspace / "a.txt").write_text("v1", encoding="utf-8")
+    cps.snapshot_after(workspace, "a.txt")
+    cps.finalize()
+    # cp2: v1 -> v2
+    cps.snapshot_before(workspace, "a.txt")
+    (workspace / "a.txt").write_text("v2", encoding="utf-8")
+    cps.snapshot_after(workspace, "a.txt")
+    cps.finalize()
+
+    ctx = SimpleNamespace(agent=agent, config=config, workspace=workspace,
+                          checkpoints=cps, ui=None)
+    reg = SlashRegistry()
+    register_builtin_commands(reg)
+    assert reg.get("checkpoint") is not None
+    out = reg.run("checkpoint", "", ctx)
+    assert "#1" in out and "#2" in out and "a.txt" in out
+    out2 = reg.run("checkpoint", "rollback 1", ctx)
+    assert "已回滚到检查点 #1" in out2
+    assert (workspace / "a.txt").read_text(encoding="utf-8") == "v1"  # cp1 之后的状态(撤销 cp2)
+    assert any("回滚" in (m.get("content") or "") for m in agent.history.messages)

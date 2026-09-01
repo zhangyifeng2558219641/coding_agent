@@ -32,6 +32,7 @@ class SessionContext:
     slash: Any
     ui: Any
     cli_running: bool = True
+    checkpoints: Any = None
 
 
 class Session:
@@ -72,10 +73,12 @@ class Session:
             agent=agent, config=self.config, workspace=self.workspace,
             registry=self.registry, memory=self.memory, skills=self.skills,
             mcp=self.mcp, slash=self.slash, ui=self.ui, cli_running=self.cli_running,
+            checkpoints=getattr(agent, "checkpoints", None),
         )
 
     def make_agent(self, history: Optional[History] = None, ui: Optional[UISink] = None,
-                   permission_mode: Optional[str] = None) -> AgentLoop:
+                   permission_mode: Optional[str] = None,
+                   checkpoints=None) -> AgentLoop:
         """按传入的 history 构造 AgentLoop;history 缺省用会话默认历史。
 
         传入 history 时同样会补齐 system 提示(基础/记忆/技能),保证子会话独立可用。
@@ -95,7 +98,7 @@ class Session:
             self.config, self.workspace, self.client, self.registry,
             permissions=permissions, memory=self.memory, history=h,
             ui=ui or self.ui, hooks=self.hooks,
-            options=None,
+            options=None, checkpoints=checkpoints,
         )
 
     def connect_mcp_from_config(self) -> list[str]:

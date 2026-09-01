@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from ..agent import Team, TeamMember, WorktreeManager, WorktreeError
+from ..agent import CheckpointStore, Team, TeamMember, WorktreeManager, WorktreeError
 from .slash import SlashCommand, SlashExit
 
 
@@ -198,6 +198,48 @@ def _execute(ctx, args: str) -> str:
     return "已退出计划模式,现在可以正常执行写操作。如需按之前的计划执行,请直接下达指令。"
 
 
+def _checkpoint(ctx, args: str) -> str:
+    """查看文件检查点,或回滚工作区到某个检查点之后的状态。"""
+    cps = ctx.checkpoints
+    if cps is None:
+        return "(当前会话未启用检查点)"
+    a = args.strip()
+    if not a or a == "list":
+        cps_list = cps.list()
+        if not cps_list:
+            return "(暂无检查点:agent 写/改文件后会自动快照)"
+        lines = [f"共 {len(cps_list)} 个检查点:"]
+        for cp in cps_list:
+            files = sorted(cp["files"])
+            lines.append(f"  #{cp['seq']}  {cp['ts']}  · {len(files)} 文件 · {', '.join(files)}")
+        lines.append("用法:/checkpoint rollback <序号> 回滚到该检查点之后的状态")
+        return "\n".join(lines)
+    if a.startswith("rollback"):
+        seq = a[len("rollback"):].strip()
+        try:
+            n = int(seq)
+        except ValueError:
+            return f"无效序号: {seq or '(空)'}(用 /checkpoint 查看检查点列表)"
+        res = cps.rollback(n, ctx.workspace)
+        if "error" in res:
+            return f"回滚失败: {res['error']}"
+        detail = []
+        if res.get("restored"):
+            detail.append("恢复: " + ", ".join(res["restored"]))
+        if res.get("deleted"):
+            detail.append("删除: " + ", ".join(res["deleted"]))
+        if res.get("left_unchanged"):
+            detail.append("保留未动(文件本就存在,不可重建): " + ", ".join(res["left_unchanged"]))
+        if res.get("errors"):
+            detail.append("失败: " + ", ".join(res["errors"]))
+        note = f"已回滚到检查点 #{n}。" + ("\n" + "\n".join(detail) if detail else "")
+        # 写入历史备注,便于 /resume 恢复后仍可见
+        ctx.agent.history.append({"role": "user", "content": f"(将工作区回滚到检查点 #{n})"})
+        ctx.agent.history.append({"role": "assistant", "content": note})
+        return note
+    return "/checkpoint [list|rollback <序号>]"
+
+
 def _status(ctx, args: str) -> str:
     u = ctx.agent.usage
     return (f"工作区: {ctx.workspace}\n"
@@ -272,6 +314,10 @@ def _resume(ctx, args: str) -> str:
         ctx.agent.history.messages = data.get("messages", [])
         ctx.agent.history.summary = data.get("summary", "")
         ctx.agent.history.compact_count = data.get("compact_count", 0)
+        # 检查点随被恢复会话切换:每个 cli-<时间戳> 各有独立的 .checkpoints.json
+        if latest.name.startswith("cli-"):
+            ctx.agent.checkpoints = CheckpointStore(
+                ctx.config.session_store_path() / f"{latest.stem}.checkpoints.json")
         return f"已恢复会话历史 {latest.name}:{len(ctx.agent.history.messages)} 条消息"
     except Exception as e:
         return f"恢复失败: {e}"
@@ -295,3 +341,4 @@ def register_builtin_commands(registry) -> None:
     registry.register(SlashCommand("resume", "恢复 CLI 历史会话(多个会话时交互选择,list 查看列表)", _resume))
     registry.register(SlashCommand("plan", "进入计划模式(只读调研+输出计划);/plan <任务> 一条龙:计划→审批→执行", _plan))
     registry.register(SlashCommand("execute", "退出计划模式,开始执行", _execute))
+    registry.register(SlashCommand("checkpoint", "查看文件检查点;/checkpoint rollback <n> 回滚", _checkpoint))

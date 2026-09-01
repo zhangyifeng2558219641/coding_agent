@@ -23,6 +23,7 @@ from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from ..agent.checkpoint import CheckpointStore
 from ..agent.loop import UISink
 from ..session import Session
 from .export import conversation_to_markdown, conversation_to_text
@@ -111,6 +112,7 @@ class ConversationStore:
         self._save()
         try:
             (self.dir / f"{cid}.json").unlink(missing_ok=True)
+            (self.dir / f"{cid}.checkpoints.json").unlink(missing_ok=True)
         except OSError:
             pass
         return True
@@ -467,6 +469,47 @@ def create_app(session: Session) -> FastAPI:
         store.touch(cid, title)
         return {"ok": True}
 
+    def _checkpoints_store(cid: str) -> CheckpointStore:
+        return CheckpointStore(session.config.session_store_path() / f"{cid}.checkpoints.json")
+
+    @app.get("/api/conversations/{cid}/checkpoints")
+    def list_checkpoints(cid: str):
+        if store.get(cid) is None:
+            raise HTTPException(404, "会话不存在")
+        return {"checkpoints": _checkpoints_store(cid).list()}
+
+    @app.post("/api/conversations/{cid}/rollback")
+    def rollback_conversation(cid: str, payload: dict):
+        if store.get(cid) is None:
+            raise HTTPException(404, "会话不存在")
+        if cid in _RUNNING:
+            raise HTTPException(409, "该会话正在生成,请先停止")
+        seq = int((payload or {}).get("checkpoint") or 0)
+        res = _checkpoints_store(cid).rollback(seq, session.workspace)
+        if "error" in res:
+            raise HTTPException(400, res["error"])
+        history = session.load_history(cid)
+        if history is None:
+            from ..llm import History
+            history = History(
+                budget_tokens=session.config.context.get("budget_tokens", 64000),
+                max_tool_output=session.config.context.get("max_tool_output", 30000),
+            )
+        history.append({"role": "user", "content": f"(将工作区回滚到检查点 #{seq})"})
+        detail = []
+        if res.get("restored"):
+            detail.append("恢复: " + ", ".join(res["restored"]))
+        if res.get("deleted"):
+            detail.append("删除: " + ", ".join(res["deleted"]))
+        if res.get("left_unchanged"):
+            detail.append("保留未动(文件本就存在,不可重建): " + ", ".join(res["left_unchanged"]))
+        if res.get("errors"):
+            detail.append("失败: " + ", ".join(res["errors"]))
+        history.append({"role": "assistant", "content": f"已回滚到检查点 #{seq}。"
+                         + ("\n" + "\n".join(detail) if detail else "")})
+        session.save_history(history, cid)
+        return {"ok": True, "result": res}
+
     @app.post("/api/chat")
     async def chat(body: ChatBody):
         if not body.message.strip():
@@ -514,8 +557,11 @@ def create_app(session: Session) -> FastAPI:
                 # 以消息数是否变化为判据,避免重复记录或误写。
                 before = len(history.messages)
                 try:
+                    cps = CheckpointStore(
+                        session.config.session_store_path() / f"{body.conversation_id}.checkpoints.json")
                     agent = session.make_agent(history=history, ui=ui,
-                                               permission_mode=body.permission_mode)
+                                               permission_mode=body.permission_mode,
+                                               checkpoints=cps)
                     if body.plan_mode is not None:
                         agent.plan_mode = bool(body.plan_mode)
                     agent.stop_event = stop_event
@@ -533,7 +579,7 @@ def create_app(session: Session) -> FastAPI:
                         or slash_holder.get("resp") or "(无输出)"
                     history.append({"role": "user", "content": body.message})
                     history.append({"role": "assistant", "content": resp})
-                    session.save_history(history, body.conversation_id)
+                session.save_history(history, body.conversation_id)
 
             async def slash_stream():
                 yield _sse("meta", {"type": "slash", "command": body.message})
@@ -553,8 +599,11 @@ def create_app(session: Session) -> FastAPI:
 
         def work() -> None:
             try:
+                cps = CheckpointStore(
+                    session.config.session_store_path() / f"{body.conversation_id}.checkpoints.json")
                 agent = session.make_agent(history=history, ui=ui,
-                                           permission_mode=body.permission_mode)
+                                           permission_mode=body.permission_mode,
+                                           checkpoints=cps)
                 if body.plan_mode is not None:
                     agent.plan_mode = bool(body.plan_mode)
                 agent.stop_event = stop_event
@@ -779,6 +828,41 @@ _INDEX_HTML = """<!DOCTYPE html>
   #approvePlan:hover { filter:brightness(1.1); }
   #dismissPlan { border:1px solid var(--border); background:var(--panel); color:var(--dim);
                  border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; flex-shrink:0; }
+  /* ---- 检查点面板 ---- */
+  #checkpointBtn.active { background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+  #checkpointPanel { position:absolute; top:56px; right:14px; width:380px; max-height:70%;
+                     background:var(--panel); border:1px solid var(--border); border-radius:10px;
+                     box-shadow:0 8px 24px rgba(0,0,0,.28); z-index:30; display:flex;
+                     flex-direction:column; overflow:hidden; }
+  #checkpointPanel.hidden { display:none; }
+  #checkpointHead { display:flex; align-items:center; justify-content:space-between; padding:10px 14px;
+                    font-size:13px; font-weight:600; color:var(--text); background:var(--panel2);
+                    border-bottom:1px solid var(--border); }
+  #checkpointClose { border:none; background:none; color:var(--dim); font-size:16px; cursor:pointer; }
+  #checkpointClose:hover { color:var(--err); }
+  #checkpointList { overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:8px; }
+  .cp-row { border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:12px; }
+  .cp-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }
+  .cp-title { font-weight:600; color:var(--text); }
+  .cp-time { color:var(--dim); font-size:11px; }
+  .cp-files { display:flex; flex-wrap:wrap; gap:4px; margin-top:2px; }
+  .cp-file { background:var(--panel2); border:1px solid var(--border); border-radius:4px;
+             padding:1px 6px; font-size:11px; color:var(--dim); cursor:pointer; }
+  .cp-file:hover { color:var(--accent); border-color:var(--accent); }
+  .cp-file.active { color:var(--accent); border-color:var(--accent); }
+  .cp-diff { margin-top:6px; border:1px solid var(--border); border-radius:6px; background:var(--panel2);
+             max-height:220px; overflow-y:auto; font-family:Consolas,"Courier New",monospace; font-size:11px;
+             line-height:1.5; white-space:pre; }
+  .cp-diff .d { padding:1px 8px; }
+  .diff-add { background:rgba(61,220,132,.12); color:var(--ok); }
+  .diff-del { background:rgba(255,107,107,.12); color:var(--err); }
+  .diff-ctx { color:var(--dim); }
+  .cp-sum { color:var(--dim); font-size:11px; margin-top:2px; }
+  .cp-action { margin-top:6px; display:flex; justify-content:flex-end; }
+  .cp-rollback { border:1px solid var(--border); background:var(--panel); color:var(--text);
+                 border-radius:6px; padding:3px 10px; font-size:11px; cursor:pointer; }
+  .cp-rollback:hover { background:var(--err); color:var(--on-accent); border-color:var(--err); }
+  .cp-empty { color:var(--dim); font-size:12px; text-align:center; padding:24px 0; }
   /* ---- 斜杠命令自动补全 ---- */
   #slashMenu { background:var(--panel); border:1px solid var(--border); border-radius:8px;
                max-height:220px; overflow-y:auto; font-size:12px; }
@@ -851,6 +935,13 @@ _INDEX_HTML = """<!DOCTYPE html>
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
     <button id="clearBtn">清空当前会话</button>
     <button id="planBtn" title="计划模式:只读调研+输出计划,审批后再执行">计划模式</button>
+    <button id="checkpointBtn" title="查看文件检查点,可一键回滚">检查点</button>
+  </div>
+  <div id="checkpointPanel" class="hidden">
+    <div id="checkpointHead">检查点(文件快照 / 回滚)
+      <button id="checkpointClose" title="关闭">✕</button>
+    </div>
+    <div id="checkpointList"></div>
   </div>
   <div id="messages"></div>
   <div id="inputBar">
@@ -957,6 +1048,7 @@ function startRename(cid, convEl) {
 async function openConv(id) {
   state.cur = id;
   state.resendAt = null; state.turnOk = false; state.isSlash = false; state.planMode = false;
+  openCpFile = null; closeCheckpointPanel();
   updatePlanBtn(); hidePlanBar();
   refreshList();
   clearAskBar(); clearChooseBar(); closeSlashMenu();
@@ -965,6 +1057,7 @@ async function openConv(id) {
     const data = await api("/api/conversations/" + id);
     $("messages").innerHTML = "";
     renderMessages(data.messages);
+    refreshCheckpoints();
   } catch(e) {
     $("messages").innerHTML = "";
     addMsg("system", "加载会话失败: " + (e.message || e));
@@ -975,6 +1068,97 @@ async function newConv() {
   await openConv(c.id);
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- 文件检查点:查看快照 diff 与一键回滚 ----
+let checkpoints = [], openCpFile = null;
+async function refreshCheckpoints() {
+  if (!state.cur) { checkpoints = []; $("checkpointBtn").textContent = "检查点"; return; }
+  try {
+    const data = await api(`/api/conversations/${state.cur}/checkpoints`);
+    checkpoints = data.checkpoints || [];
+  } catch(e) { checkpoints = []; }
+  $("checkpointBtn").textContent = checkpoints.length ? "检查点(" + checkpoints.length + ")" : "检查点";
+  if (!$("checkpointPanel").classList.contains("hidden")) renderCheckpoints();
+}
+function closeCheckpointPanel() {
+  $("checkpointPanel").classList.add("hidden");
+  $("checkpointBtn").classList.remove("active");
+}
+// 简化行级 diff:前缀/后缀裁剪,计数 + 增删块,保留上下文,超长截断
+function lineDiff(before, after) {
+  const oldL = before ? before.split("\\n") : [];
+  const newL = after ? after.split("\\n") : [];
+  let i = 0;
+  while (i < oldL.length && i < newL.length && oldL[i] === newL[i]) i++;
+  let o = oldL.length, n = newL.length;
+  while (o > i && n > i && oldL[o-1] === newL[n-1]) { o--; n--; }
+  const del = oldL.slice(i, o), add = newL.slice(i, n);
+  const ctx = 2, rows = [];
+  for (let k = Math.max(0, i - ctx); k < i; k++) rows.push({t:"ctx", line: oldL[k], num: k+1});
+  for (const ln of del) rows.push({t:"del", line: ln});
+  for (const ln of add) rows.push({t:"add", line: ln});
+  const t0 = Math.min(o, n), maxLen = Math.max(oldL.length, newL.length);
+  for (let k = Math.max(t0, i); k < Math.min(t0 + ctx, maxLen); k++)
+    rows.push({t:"ctx", line: k < oldL.length ? oldL[k] : newL[k], num: k+1});
+  const MAX = 40;
+  let skipped = 0;
+  if (rows.length > MAX) { skipped = rows.length - MAX; rows.length = MAX; }
+  let html = "";
+  for (const r of rows) {
+    const cls = r.t === "del" ? " diff-del" : r.t === "add" ? " diff-add" : " diff-ctx";
+    const sign = r.t === "del" ? "-" : r.t === "add" ? "+" : " ";
+    html += `<span class="d${cls}">${sign} ${esc(r.line)}</span>\\n`;
+  }
+  if (skipped) html += `<span class="d diff-ctx">…(省略 ${skipped} 行)</span>\\n`;
+  return {add: add.length, del: del.length, html};
+}
+function renderCheckpoints() {
+  const list = $("checkpointList");
+  if (!checkpoints.length) {
+    list.innerHTML = `<div class="cp-empty">暂无检查点。让 agent 写/改文件后,这里会出现可回滚的快照。</div>`;
+    return;
+  }
+  list.innerHTML = checkpoints.map(cp => {
+    const files = Object.keys(cp.files || {});
+    const sums = files.map(f => {
+      const d = cp.files[f];
+      const r = lineDiff(d.before, d.after);
+      return `${esc(f)} <b class="diff-add">+${r.add}</b>/<b class="diff-del">-${r.del}</b>`;
+    }).join(" · ");
+    const chips = files.map(f =>
+      `<span class="cp-file${openCpFile === f ? " active" : ""}" data-f="${esc(f)}">${esc(f)}</span>`).join("");
+    let diffHtml = "";
+    if (openCpFile && files.indexOf(openCpFile) !== -1) {
+      const d = cp.files[openCpFile];
+      diffHtml = `<div class="cp-diff">${lineDiff(d.before, d.after).html}</div>`;
+    }
+    return `<div class="cp-row">
+      <div class="cp-head"><span class="cp-title">#${cp.seq}</span><span class="cp-time">${esc(cp.ts)}</span></div>
+      <div class="cp-sum">${sums}</div>
+      <div class="cp-files">${chips}</div>
+      ${diffHtml}
+      <div class="cp-action"><button class="cp-rollback" data-seq="${cp.seq}">回滚到此</button></div>
+    </div>`;
+  }).join("");
+  list.querySelectorAll(".cp-file").forEach(el => {
+    el.onclick = () => { openCpFile = openCpFile === el.dataset.f ? null : el.dataset.f; renderCheckpoints(); };
+  });
+  list.querySelectorAll(".cp-rollback").forEach(el => {
+    el.onclick = () => doRollback(parseInt(el.dataset.seq, 10));
+  });
+}
+async function doRollback(seq) {
+  if (!state.cur) return;
+  if (!confirm(`确定回滚工作区到检查点 #${seq} 之后的状态?期间对该文件的改动会被覆盖。`)) return;
+  try {
+    await api(`/api/conversations/${state.cur}/rollback`,
+      {method:"POST", body: JSON.stringify({checkpoint: seq})});
+    reloadMessages(); refreshList(); refreshCheckpoints(); closeCheckpointPanel();
+    addMsg("system", `已回滚到检查点 #${seq},工作区文件已还原。`);
+  } catch(e) {
+    addMsg("system", "回滚失败: " + (e.message || e));
+  }
+}
 
 // ---- 斜杠命令自动补全(数据来自 /api/config 的 slash_commands) ----
 function parseSlashCmds(list) {
@@ -1453,6 +1637,9 @@ function handleEvent(ev, wrap) {
     case "turn_end":
       state.turnOk = !!d.success;
       break;
+    case "checkpoint":
+      refreshCheckpoints();
+      break;
     case "error": clearAskBar(); clearChooseBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
     case "done":
       clearAskBar(); clearChooseBar();
@@ -1460,6 +1647,7 @@ function handleEvent(ev, wrap) {
       // 斜杠命令输入输出现已持久化,同样重渲染以便立即呈现(而非等下次刷新)
       if (state.turnOk || state.isSlash) reloadMessages();
       refreshList();
+      refreshCheckpoints();
       // 计划模式下成功出计划 → 弹出「批准并执行」审批条
       if (state.planMode && state.turnOk && !state.isSlash) showPlanBar();
       else hidePlanBar();
@@ -1548,6 +1736,15 @@ $("permSelect").onchange = e => state.permMode = e.target.value;
 $("planBtn").onclick = () => { state.planMode = !state.planMode; updatePlanBtn(); hidePlanBar(); };
 $("approvePlan").onclick = approvePlan;
 $("dismissPlan").onclick = dismissPlan;
+$("checkpointBtn").onclick = () => {
+  const p = $("checkpointPanel");
+  if (p.classList.contains("hidden")) {
+    renderCheckpoints();
+    p.classList.remove("hidden");
+    $("checkpointBtn").classList.add("active");
+  } else closeCheckpointPanel();
+};
+$("checkpointClose").onclick = closeCheckpointPanel;
 const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝", purple:"南大紫", blue:"软件蓝"};
 function applyTheme(name) {
   if (!THEMES[name]) name = "dark";

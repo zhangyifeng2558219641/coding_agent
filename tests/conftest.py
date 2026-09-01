@@ -83,8 +83,8 @@ def config(workspace: Path) -> Config:
 
 
 def make_agent(config: Config, workspace: Path, script, registry: Optional[ToolRegistry] = None,
-               perm_mode: str = "auto-approve", ui=None) -> AgentLoop:
+               perm_mode: str = "auto-approve", ui=None, checkpoints=None) -> AgentLoop:
     reg = registry or default_registry(with_memory=True, with_agent_tools=False)
     perms = PermissionPolicy({**config.permissions, "mode": perm_mode}, workspace)
     return AgentLoop(config, workspace, MockClient(script), reg,
-                     permissions=perms, ui=ui or None)
+                     permissions=perms, ui=ui or None, checkpoints=checkpoints)

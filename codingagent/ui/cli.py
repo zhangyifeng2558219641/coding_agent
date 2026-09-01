@@ -11,6 +11,7 @@ from typing import Any, Optional
 from rich.console import Console
 from rich.panel import Panel
 
+from ..agent.checkpoint import CheckpointStore
 from ..agent.loop import UISink
 from ..commands.slash import SlashExit
 
@@ -183,11 +184,13 @@ def run_cli(session) -> None:
     if connected:
         console.print(f"MCP 已连接: {', '.join(connected)}", style="dim")
 
-    agent = session.make_agent()
-    ctx = session.context(agent)
-    session.cli_running = True
     # 本次 CLI 会话的唯一标识:历史保存为 cli-<时间戳>.json,便于 /resume 区分多次会话
     cli_sid = time.strftime("%Y%m%d-%H%M%S")
+    # 检查点存储:本会话文件快照持久化到 cli-<时间戳>.checkpoints.json
+    cps = CheckpointStore(session.config.session_store_path() / f"cli-{cli_sid}.checkpoints.json")
+    agent = session.make_agent(checkpoints=cps)
+    ctx = session.context(agent)
+    session.cli_running = True
 
     console.print(f"工作区: {session.workspace}   模型: {agent.client.model}", style="dim")
 
@@ -213,7 +216,7 @@ def run_cli(session) -> None:
             if len(agent.history.messages) == before:
                 agent.history.append({"role": "user", "content": line})
                 agent.history.append({"role": "assistant", "content": response or "(无输出)"})
-                session.save_history(agent.history, f"cli-{cli_sid}")
+            session.save_history(agent.history, f"cli-{cli_sid}")
             continue
         try:
             agent.run(line)

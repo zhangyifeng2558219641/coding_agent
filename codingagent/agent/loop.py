@@ -23,8 +23,9 @@ from ..llm.history import History
 from ..prompts import base_system_prompt
 from ..types import FinalResult, ToolCall, ToolResult, Usage
 from ..tools import ToolContext, ToolRegistry
+from .checkpoint import CheckpointStore
 from .memory import MemoryStore
-from .permissions import Decision, PermissionPolicy
+from .permissions import Decision, PermissionPolicy, _is_within
 
 # 计划模式:只读调研 + 结构化计划,供 run() 按需注入 system(不入持久化)
 PLAN_MODE_PROMPT = (
@@ -86,6 +87,7 @@ class AgentLoop:
         hooks=None,
         options: Optional[AgentOptions] = None,
         stop_event: Optional[threading.Event] = None,
+        checkpoints: Optional[CheckpointStore] = None,
     ):
         self.config = config
         self.workspace = workspace.resolve()
@@ -121,6 +123,8 @@ class AgentLoop:
         self.plan_mode = False
         # 线程安全停止信号(Web「停止生成」用):interrupt() 或外部 set() 都会让主循环尽快退出
         self.stop_event = stop_event
+        # 文件检查点:WriteFile/EditFile 自动快照 before/after,回合末 finalize 成一条
+        self.checkpoints = checkpoints or CheckpointStore(None)
 
     # ------------------------------------------------------------------ 公共
     @property
@@ -146,6 +150,7 @@ class AgentLoop:
     def run(self, user_text: str) -> FinalResult:
         start = time.monotonic()
         self._interrupted = False
+        self.checkpoints.begin_turn()
         # 按当前模式增删计划模式系统提示(system 段不入持久化,每轮自清洁)
         if self.plan_mode:
             self.history.add_system_part("plan", PLAN_MODE_PROMPT)
@@ -231,6 +236,9 @@ class AgentLoop:
             last_error = "用户中断"
             self._interrupted = True
 
+        # 回合收尾:把本轮写盘的 before/after 落成检查点(所有退出路径汇合于此)
+        self._finalize_checkpoint()
+
         # 异常结束(LLM 失败/空响应/超限/中断)一律显式上报,避免 UI 静默结束
         if last_error:
             self.ui.event("error", {"message": last_error})
@@ -268,6 +276,37 @@ class AgentLoop:
         if self.plan_mode:
             tools = [t for t in tools if t.read_only]
         return [t.to_openai_function() for t in tools]
+
+    def _finalize_checkpoint(self) -> None:
+        """把本回合 pending 的检查点落盘并通知 UI;失败绝不中断回合。"""
+        try:
+            cp = self.checkpoints.finalize()
+            if cp:
+                self.ui.event("checkpoint", {"seq": cp["seq"], "ts": cp["ts"],
+                                             "files": sorted(cp["files"])})
+        except Exception:
+            pass
+
+    def _checkpoint_relpath(self, ctx: ToolContext, raw: Any) -> Optional[str]:
+        """WriteFile/EditFile 写前快照,返回工作区内相对路径;越界/敏感/自写跳过。"""
+        if not raw:
+            return None
+        try:
+            path = ctx.resolve(str(raw))
+        except Exception:
+            return None
+        if not _is_within(path, self.workspace):
+            return None
+        if self.permissions._check_sensitive_path(path):
+            return None
+        try:
+            rel = path.relative_to(self.workspace).as_posix()
+        except ValueError:
+            return None
+        if rel == ".coding_agent" or rel.startswith(".coding_agent/"):
+            return None  # 不跟踪自写文件,避免检查点套娃/泄露密钥
+        self.checkpoints.snapshot_before(self.workspace, rel)
+        return rel
 
     def _is_plan_readonly_bash(self, call: ToolCall) -> bool:
         """计划模式下判断 Bash 命令是否只读(git log/ls/cat 等),含管道可、重定向/链式不可。"""
@@ -335,11 +374,21 @@ class AgentLoop:
             emit=lambda t, d: self.ui.event(t, d),
         )
 
+        # 文件写工具:写前快照(跳过越界/敏感/自写),成功写盘后快照 after
+        cp_rel = None
+        if call.name in ("WriteFile", "EditFile") and call.arguments.get("path"):
+            cp_rel = self._checkpoint_relpath(ctx, call.arguments.get("path"))
+
         try:
             result = tool.run(ctx, **call.arguments)
         except Exception as e:
             result = ToolResult(name=call.name, call_id=call.id, success=False,
                                 error=f"工具异常: {type(e).__name__}: {e}")
+        if cp_rel is not None:
+            if result.success:
+                self.checkpoints.snapshot_after(self.workspace, cp_rel)
+            else:
+                self.checkpoints.discard(cp_rel)  # 写失败不记录
         # 工具自身创建的 ToolResult 通常不带 call_id,必须补上,
         # 否则发给模型的 tool 消息 tool_call_id 为空,网关会 400 拒绝
         result.call_id = call.id
