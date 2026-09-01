@@ -111,6 +111,34 @@ def _sse(type: str, data: dict[str, Any]) -> str:
     return f"event: {type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+async def _coalesce(queue: asyncio.Queue, alive) -> Any:
+    """消费队列并实时产出 (type, data);相邻 text 增量按小时间窗合并成一条,
+    降低事件密度 —— 6 成员并行流式时 LLM 逐 token 的 delta 会成千上万条,
+    不合并会让浏览器逐条渲染、被拖到卡死。非 text 事件(工具/状态等)到即发。"""
+    loop = asyncio.get_event_loop()
+    pending: list[str] = []
+    last_flush = loop.time()
+    while alive() or not queue.empty():
+        try:
+            t, d = await asyncio.wait_for(queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            t, d = None, None
+        if t == "text":
+            pending.append(d.get("delta", ""))
+        elif t is not None:
+            if pending:
+                yield "text", {"delta": "".join(pending)}
+                pending.clear()
+            yield t, d
+        now = loop.time()
+        if pending and now - last_flush >= 0.1:
+            yield "text", {"delta": "".join(pending)}
+            pending.clear()
+            last_flush = now
+    if pending:
+        yield "text", {"delta": "".join(pending)}
+
+
 def _default_title(message: str) -> str:
     msg = message.strip().replace("\n", " ")
     return msg[:24] + ("…" if len(msg) > 24 else "")
@@ -184,17 +212,32 @@ def create_app(session: Session) -> FastAPI:
         ui = SSEUI(lambda t, d: loop.call_soon_threadsafe(q.put_nowait, (t, d)))
 
         if body.message.startswith("/"):
+            # 斜杠命令(尤其 /team 这类长任务)也在 worker 线程执行并实时下发队列事件,
+            # 否则会阻塞事件循环,直到整个命令跑完才一次性吐出结果(看起来"卡住后一大串")。
+            slash_holder: dict[str, Any] = {}
+
+            def slash_work() -> None:
+                try:
+                    agent = session.make_agent(history=history, ui=ui,
+                                               permission_mode=body.permission_mode)
+                    ctx = session.context(agent)
+                    slash_holder["resp"] = session.slash.run(
+                        body.message[1:].partition(" ")[0],
+                        body.message[1:].partition(" ")[2].strip(), ctx)
+                except Exception as e:  # pragma: no cover
+                    slash_holder["error"] = str(e)
+
             async def slash_stream():
                 yield _sse("meta", {"type": "slash", "command": body.message})
-                agent = session.make_agent(history=history, ui=ui,
-                                           permission_mode=body.permission_mode)
-                ctx = session.context(agent)
-                try:
-                    resp = session.slash.run(body.message[1:].partition(" ")[0],
-                                             body.message[1:].partition(" ")[2].strip(), ctx)
-                except Exception as e:
-                    resp = f"命令执行失败: {e}"
-                yield _sse("text", {"delta": resp or "(无输出)"})
+                thread = threading.Thread(target=slash_work, daemon=True)
+                thread.start()
+                async for t, d in _coalesce(q, thread.is_alive):
+                    yield _sse(t, d)
+                if "error" in slash_holder:
+                    resp = f"命令执行失败: {slash_holder['error']}"
+                else:
+                    resp = slash_holder.get("resp") or "(无输出)"
+                yield _sse("text", {"delta": resp})
                 yield _sse("done", {"conversation_id": body.conversation_id})
             return StreamingResponse(slash_stream(), media_type="text/event-stream")
 
@@ -215,14 +258,7 @@ def create_app(session: Session) -> FastAPI:
             yield _sse("start", {"conversation_id": body.conversation_id})
             thread = threading.Thread(target=work, daemon=True)
             thread.start()
-            while thread.is_alive() or not q.empty():
-                try:
-                    t, d = await asyncio.wait_for(q.get(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    continue
-                yield _sse(t, d)
-            while not q.empty():
-                t, d = q.get_nowait()
+            async for t, d in _coalesce(q, thread.is_alive):
                 yield _sse(t, d)
             if "error" in result_holder:
                 yield _sse("error", {"message": result_holder["error"]})
@@ -465,7 +501,10 @@ function parseSSE(data) {
 // ---- 流式渲染:按"轮"归组,一段文本和紧随其后的工具调用放入同一消息块 ----
 // 用 status("第 N 轮推理…") 作为轮次边界:每轮开头强制新消息块,
 // 轮内的多个(并行)工具调用归入同一块。
+// 关键:文本增量先攒进 pending,用 requestAnimationFrame 每帧批量刷一次 DOM 并滚动,
+// 否则团队并行流式时逐 token 渲染会把页面拖死(浏览器提示"页面无响应")。
 let currentMsg = null, currentBubble = null, roundStart = false;
+let pendingDelta = "", pendingBubble = null, flushScheduled = false;
 function clearCursor() {
   if (currentBubble) { const c = currentBubble.querySelector(".cursor"); if (c) c.remove(); }
 }
@@ -478,6 +517,23 @@ function ensureAssistantBubble(forceNew) {
   }
   return currentBubble;
 }
+function scheduleFlush() {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  requestAnimationFrame(flushPending);
+}
+function flushPending() {
+  flushScheduled = false;
+  if (pendingDelta && pendingBubble) {
+    const c = pendingBubble.querySelector(".cursor"); if (c) c.remove();
+    pendingBubble.textContent += pendingDelta;
+    pendingDelta = "";
+    const cursor = document.createElement("span"); cursor.className="cursor"; pendingBubble.appendChild(cursor);
+  }
+  pendingBubble = null;
+  const wrap = $("messages");
+  wrap.scrollTop = wrap.scrollHeight;
+}
 
 async function send() {
   const text = $("input").value.trim();
@@ -486,6 +542,7 @@ async function send() {
   $("input").value = ""; state.busy = true; $("send").disabled = true;
   addMsg("user", text);
   currentMsg = null; currentBubble = null; roundStart = false;
+  pendingDelta = ""; pendingBubble = null;
   const wrap = $("messages");
   let buf = "";
   try {
@@ -513,10 +570,9 @@ function handleEvent(ev, wrap) {
   let d; try { d = JSON.parse(ev.data); } catch { d = {}; }
   switch (ev.event) {
     case "text": {
-      const b = ensureAssistantBubble();
-      clearCursor();
-      b.textContent += (d.delta || "");
-      const cursor = document.createElement("span"); cursor.className="cursor"; b.appendChild(cursor);
+      pendingDelta += (d.delta || "");
+      pendingBubble = ensureAssistantBubble();
+      scheduleFlush();
       break; }
     case "tool_call":
       ensureAssistantBubble();
@@ -537,7 +593,7 @@ function handleEvent(ev, wrap) {
     case "error": ensureAssistantBubble().textContent += "\\n✗ " + (d.message || ""); break;
     case "done": refreshList(); break;
   }
-  wrap.scrollTop = wrap.scrollHeight;
+  scheduleFlush();
 }
 
 $("send").onclick = send;

@@ -23,6 +23,9 @@ def make_client_session(workspace: Path, script):
                   "skills": {"dirs": []},
                   "commands": {"dir": str(workspace / ".coding_agent" / "commands")},
                   "mcp": {"servers": {}},
+                  "teams": {"demo-team": {"members": [
+                      {"name": "成员A", "role": "分析员"},
+                  ]}},
                   "sessions_dir": str(workspace / ".coding_agent" / "sessions")},
                  workspace)
     session = Session(cfg)
@@ -105,6 +108,27 @@ def test_web_chat_slash_command(tmp_path: Path):
             r = await c.post("/api/chat",
                              json={"conversation_id": cid, "message": "/tools"})
             assert "ReadFile" in r.text
+            assert "done" in r.text
+
+    run(go())
+
+
+def test_web_slash_team_streams_status(tmp_path: Path):
+    """/team 长任务:状态事件(如"开始并行作业")应作为独立 status 事件流式下发,
+    而非整段结果一次性吐出(回归:slash 分支曾阻塞事件循环且不排空队列)。"""
+    session = make_client_session(tmp_path, [("成员完成", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.post("/api/chat",
+                             json={"conversation_id": cid,
+                                   "message": "/team demo-team 完成一次计划"})
+            assert "event: status" in r.text
+            assert "开始并行作业" in r.text
+            assert "负责人正在汇总" in r.text
+            assert "(mock 摘要)" in r.text  # 负责人汇总产出
             assert "done" in r.text
 
     run(go())

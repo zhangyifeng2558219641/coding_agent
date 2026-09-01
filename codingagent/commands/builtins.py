@@ -138,7 +138,7 @@ def _team(ctx, args: str) -> str:
     if not members:
         return f"团队 {name} 没有成员"
     team = Team(name, members, ctx.config, ctx.workspace, ctx.agent.client,
-                ctx.registry, permissions=ctx.agent.permissions, ui=ctx.ui)
+                ctx.registry, permissions=ctx.agent.permissions, ui=ctx.agent.ui)
     r = team.run(task)
     return r.final_text or r.error or "(空结果)"
 
