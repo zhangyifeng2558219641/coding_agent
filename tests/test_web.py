@@ -213,3 +213,82 @@ def test_web_chat_unregisters_running(tmp_path: Path):
             assert cid not in webmod._RUNNING
 
     run(go())
+
+
+def test_web_export_markdown(tmp_path: Path):
+    """导出 Markdown:含用户消息/助手分节/工具调用与结果,并作为附件下载。"""
+    session = make_client_session(tmp_path, [
+        ("我来读文件。", [ToolCall(id="1", name="ReadFile", arguments={"path": "a.py"})]),
+        ("读好了,内容是 def foo。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "请读取 a.py"})
+            r = await c.get(f"/api/conversations/{cid}/export", params={"format": "markdown"})
+            assert r.status_code == 200
+            assert "attachment" in r.headers.get("content-disposition", "")
+            assert "请读取 a.py" in r.text
+            assert "## 助手" in r.text
+            assert "ReadFile" in r.text
+
+    run(go())
+
+
+def test_web_export_json(tmp_path: Path):
+    """导出 JSON:返回带 meta 与 messages 的原始历史。"""
+    session = make_client_session(tmp_path, [("你好", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "你好"})
+            r = await c.get(f"/api/conversations/{cid}/export", params={"format": "json"})
+            data = r.json()
+            assert data["meta"]["id"] == cid
+            assert any(m.get("role") == "user" for m in data["messages"])
+
+    run(go())
+
+
+def test_web_export_text(tmp_path: Path):
+    """导出纯文本:可读的【用户】/【助手】转写。"""
+    session = make_client_session(tmp_path, [("你好", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "你好"})
+            r = await c.get(f"/api/conversations/{cid}/export", params={"format": "text"})
+            assert "【用户】你好" in r.text
+
+    run(go())
+
+
+def test_web_export_404(tmp_path: Path):
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.get("/api/conversations/none/export", params={"format": "markdown"})
+            assert r.status_code == 404
+
+    run(go())
+
+
+def test_web_export_bad_format(tmp_path: Path):
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.get(f"/api/conversations/{cid}/export", params={"format": "pdf"})
+            assert r.status_code == 400
+
+    run(go())

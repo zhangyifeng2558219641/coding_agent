@@ -10,18 +10,21 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import re
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..agent.loop import UISink
 from ..session import Session
+from .export import conversation_to_markdown, conversation_to_text
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +180,40 @@ def create_app(session: Session) -> FastAPI:
     def create_conversation(payload: dict):
         title = (payload or {}).get("title") or "新会话"
         return store.create(title)
+
+    @app.get("/api/conversations/{cid}/export")
+    def export_conversation(cid: str, format: str = "markdown"):
+        """把会话导出为文件下载:markdown(可读记录)/ json(原始历史)/ text(纯文本)。"""
+        meta = store.get(cid)
+        if not meta:
+            raise HTTPException(404, "会话不存在")
+        history_dict: dict[str, Any] = {}
+        hist_path = store.history_path(cid)
+        if hist_path.exists():
+            try:
+                history_dict = json.loads(hist_path.read_text(encoding="utf-8"))
+            except Exception:
+                history_dict = {}
+        messages = history_dict.get("messages", [])
+
+        if format == "json":
+            content = json.dumps({"meta": meta, **history_dict}, ensure_ascii=False, indent=2)
+            media, ext = "application/json; charset=utf-8", "json"
+        elif format == "markdown":
+            content = conversation_to_markdown(meta, messages)
+            media, ext = "text/markdown; charset=utf-8", "md"
+        elif format == "text":
+            content = conversation_to_text(meta, messages)
+            media, ext = "text/plain; charset=utf-8", "txt"
+        else:
+            raise HTTPException(400, f"未知导出格式: {format}")
+
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", meta.get("title") or "会话")
+        filename = f"{safe_title}.{ext}"
+        return Response(
+            content, media_type=media,
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+        )
 
     @app.get("/api/conversations/{cid}")
     def get_conversation(cid: str):
@@ -445,6 +482,12 @@ _INDEX_HTML = """<!DOCTYPE html>
       <option value="nord">主题:夜间蓝</option>
       <option value="purple">主题:南大紫</option>
       <option value="blue">主题:软件蓝</option>
+    </select>
+    <select id="exportSel" title="导出当前会话为文件">
+      <option value="">导出会话…</option>
+      <option value="markdown">导出为 Markdown</option>
+      <option value="json">导出为 JSON(原始历史)</option>
+      <option value="text">导出为纯文本</option>
     </select>
     <button id="clearBtn">清空当前会话</button>
   </div>
@@ -807,6 +850,15 @@ $("input").addEventListener("keydown", e => {
 });
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };
+$("exportSel").onchange = e => {
+  const f = e.target.value;
+  if (f && state.cur) {
+    const a = document.createElement("a");
+    a.href = `/api/conversations/${state.cur}/export?format=${f}`;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  e.target.value = "";
+};
 $("permSelect").onchange = e => state.permMode = e.target.value;
 const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝", purple:"南大紫", blue:"软件蓝"};
 function applyTheme(name) {
