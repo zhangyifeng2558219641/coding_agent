@@ -271,6 +271,14 @@ _INDEX_HTML = """<!DOCTYPE html>
   html[data-theme="nord"] { --bg:#1b1e27; --panel:#232a3b; --panel2:#2c3547; --text:#d8dee9;
           --dim:#8294ad; --accent:#88c0d0; --border:#3a4458; --ok:#a3be8c; --err:#bf616a;
           --on-accent:#11141c; }
+  /* 南大紫:官方标准色 C50 M100 Y0 K40 → RGB(106,0,95) #6A005F 的暗色系变体 */
+  html[data-theme="purple"] { --bg:#170e23; --panel:#201431; --panel2:#2a1b41; --text:#f0eaf8;
+          --dim:#a48fc0; --accent:#c14eb0; --border:#3d2a58; --ok:#3ddc84; --err:#ff6b6b;
+          --on-accent:#ffffff; }
+  /* 软件蓝:软件学院院名字标的蓝色 #7091C7,深色导航背景上配深蓝文字 */
+  html[data-theme="blue"] { --bg:#0b1322; --panel:#121a2e; --panel2:#182340; --text:#e9eef9;
+          --dim:#8d9cb8; --accent:#7091c7; --border:#24324f; --ok:#3ddc84; --err:#ff6b6b;
+          --on-accent:#0b1322; }
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:var(--bg); color:var(--text); font-family:"Segoe UI", system-ui, "Microsoft YaHei", sans-serif;
          display:flex; height:100vh; overflow:hidden; }
@@ -344,6 +352,8 @@ _INDEX_HTML = """<!DOCTYPE html>
       <option value="light">主题:浅色</option>
       <option value="warm">主题:暖色护眼</option>
       <option value="nord">主题:夜间蓝</option>
+      <option value="purple">主题:南大紫</option>
+      <option value="blue">主题:软件蓝</option>
     </select>
     <button id="clearBtn">清空当前会话</button>
   </div>
@@ -537,7 +547,7 @@ $("input").addEventListener("keydown", e => {
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };
 $("permSelect").onchange = e => state.permMode = e.target.value;
-const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝"};
+const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝", purple:"南大紫", blue:"软件蓝"};
 function applyTheme(name) {
   if (!THEMES[name]) name = "dark";
   document.documentElement.dataset.theme = name;
