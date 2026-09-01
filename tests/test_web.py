@@ -292,3 +292,91 @@ def test_web_export_bad_format(tmp_path: Path):
             assert r.status_code == 400
 
     run(go())
+
+
+def test_web_import_roundtrip(tmp_path: Path):
+    """导出 → 删除 → 导入:新会话保留标题与三种 role 的消息。"""
+    session = make_client_session(tmp_path, [
+        ("我来读文件。", [ToolCall(id="1", name="ReadFile", arguments={"path": "a.py"})]),
+        ("读好了。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={"title": "原始标题"})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "请读取 a.py"})
+            exported = (await c.get(f"/api/conversations/{cid}/export", params={"format": "json"})).json()
+            assert await c.delete(f"/api/conversations/{cid}") is not None
+
+            new_meta = (await c.post("/api/conversations/import", json=exported)).json()
+            assert new_meta["id"] != cid
+            assert new_meta["title"] == "原始标题"
+            got = (await c.get(f"/api/conversations/{new_meta['id']}")).json()
+            roles = [m["role"] for m in got["messages"]]
+            assert "user" in roles and "assistant" in roles and "tool" in roles
+            assert got["messages"][0]["content"] == "请读取 a.py"
+            assert got["messages"][1]["tool_calls"][0]["function"]["name"] == "ReadFile"
+
+    run(go())
+
+
+def test_web_import_raw_history(tmp_path: Path):
+    """无 meta 的 {messages:[...]}:标题回退到首条用户消息。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            payload = {"messages": [
+                {"role": "user", "content": "帮我写一个 hello"},
+                {"role": "assistant", "content": "好的。"},
+            ]}
+            meta = (await c.post("/api/conversations/import", json=payload)).json()
+            assert meta["title"] == "帮我写一个 hello"
+            got = (await c.get(f"/api/conversations/{meta['id']}")).json()
+            assert len(got["messages"]) == 2
+
+    run(go())
+
+
+def test_web_import_invalid_json(tmp_path: Path):
+    """body 不是对象(数组) → 400。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.post("/api/conversations/import", json=[])
+            assert r.status_code == 400
+
+    run(go())
+
+
+def test_web_import_missing_messages(tmp_path: Path):
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.post("/api/conversations/import", json={"foo": 1})
+            assert r.status_code == 400
+            assert "messages" in r.text
+
+    run(go())
+
+
+def test_web_import_empty_messages(tmp_path: Path):
+    """空数组 / 只含 system → 400「没有可导入的消息」。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            assert (await c.post("/api/conversations/import", json={"messages": []})).status_code == 400
+            r = await c.post("/api/conversations/import",
+                             json={"messages": [{"role": "system", "content": "x"}]})
+            assert r.status_code == 400
+            assert "没有可导入" in r.text
+
+    run(go())

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -214,6 +214,59 @@ def create_app(session: Session) -> FastAPI:
             content, media_type=media,
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
         )
+
+    @app.post("/api/conversations/import")
+    def import_conversation(payload: Any = Body(...)):
+        """把导出的 JSON(或同构的 {messages:[...]})恢复为一个全新会话。"""
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "导入内容必须是 JSON 对象")
+        raw = payload.get("messages")
+        if not isinstance(raw, list):
+            raise HTTPException(400, "缺少 messages 数组")
+        messages: list[dict[str, Any]] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise HTTPException(400, f"messages[{i}] 不是对象")
+            role = item.get("role")
+            if role not in ("user", "assistant", "tool"):
+                continue  # 丢弃 system 等不可渲染角色
+            content = "" if item.get("content") is None else str(item.get("content"))
+            m: dict[str, Any] = {"role": role, "content": content}
+            if role == "assistant":
+                calls = []
+                for tc in (item.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    calls.append({"id": str(tc.get("id") or tc.get("tool_call_id") or ""),
+                                  "function": {"name": str(fn.get("name") or "工具"),
+                                               "arguments": str(fn.get("arguments") or "{}")}})
+                if calls:
+                    m["tool_calls"] = calls
+            elif role == "tool" and item.get("tool_call_id"):
+                m["tool_call_id"] = str(item.get("tool_call_id"))
+            messages.append(m)
+        if not messages:
+            raise HTTPException(400, "没有可导入的消息")
+
+        # 标题:导入的 meta.title → 首条用户消息 → 兜底
+        imported_meta = payload.get("meta") or {}
+        title = imported_meta.get("title") or ""
+        if not title:
+            first_user = next((x["content"] for x in messages if x["role"] == "user"), "")
+            title = _default_title(first_user) if first_user else "导入的会话"
+
+        meta = store.create(title)
+        history_dict = {"messages": messages,
+                        "summary": payload.get("summary", "") or "",
+                        "compact_count": int(payload.get("compact_count", 0) or 0),
+                        "usage": payload.get("usage") or {}}
+        try:
+            store.history_path(meta["id"]).write_text(
+                json.dumps(history_dict, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            raise HTTPException(500, "写入会话历史失败")
+        return meta  # 前端用它 openConv
 
     @app.get("/api/conversations/{cid}")
     def get_conversation(cid: str):
@@ -489,6 +542,8 @@ _INDEX_HTML = """<!DOCTYPE html>
       <option value="json">导出为 JSON(原始历史)</option>
       <option value="text">导出为纯文本</option>
     </select>
+    <button id="importBtn" title="从 JSON 文件恢复会话">导入会话</button>
+    <input type="file" id="importFile" accept=".json,application/json" style="display:none">
     <button id="clearBtn">清空当前会话</button>
   </div>
   <div id="messages"></div>
@@ -858,6 +913,21 @@ $("exportSel").onchange = e => {
     document.body.appendChild(a); a.click(); a.remove();
   }
   e.target.value = "";
+};
+$("importBtn").onclick = () => $("importFile").click();
+$("importFile").onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = "";               // 允许再次选择同一文件
+  if (!f) return;
+  try {
+    const text = await f.text();
+    const meta = await api("/api/conversations/import", {method:"POST", body: text});
+    await refreshList();
+    await openConv(meta.id);
+    addMsg("system", "已导入会话: " + meta.title);
+  } catch(err) {
+    addMsg("system", "导入失败: " + (err.message || err));
+  }
 };
 $("permSelect").onchange = e => state.permMode = e.target.value;
 const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝", purple:"南大紫", blue:"软件蓝"};
