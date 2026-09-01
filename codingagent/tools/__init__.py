@@ -6,9 +6,10 @@ from .search import Glob, Grep
 from .websearch import WebSearch
 from .memory_tools import MemoryRecall, MemorySave
 from .subagent_tool import DispatchTask
+from .user_tools import AskUser
 from .mcp import MCPClient, MCPToolAdapter, MCPManager, MCPError
 
-CORE_TOOLS: list[type[Tool]] = [ReadFile, WriteFile, EditFile, Bash, Glob, Grep, WebSearch]
+CORE_TOOLS: list[type[Tool]] = [ReadFile, WriteFile, EditFile, Bash, Glob, Grep, WebSearch, AskUser]
 MEMORY_TOOLS: list[type[Tool]] = [MemoryRecall, MemorySave]
 AGENT_TOOLS: list[type[Tool]] = [DispatchTask]
 
@@ -29,5 +30,5 @@ def default_registry(with_memory: bool = True, with_agent_tools: bool = True) ->
 
 __all__ = ["Tool", "ToolContext", "ToolRegistry", "ReadFile", "WriteFile",
            "EditFile", "Bash", "Glob", "Grep", "WebSearch", "MemoryRecall",
-           "MemorySave", "DispatchTask", "MCPClient", "MCPToolAdapter",
+           "MemorySave", "DispatchTask", "AskUser", "MCPClient", "MCPToolAdapter",
            "MCPManager", "MCPError", "default_registry"]

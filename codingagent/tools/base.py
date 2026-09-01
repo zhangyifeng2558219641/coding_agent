@@ -23,8 +23,10 @@ class ToolContext:
     memory: Any = None
     llm: Any = None
     registry: Any = None
-    # 交互回调:ask(question) -> bool;emit(event, data) 用于 Web/CLI 事件推送
+    # 交互回调:ask(question) -> bool;choose(prompt, options) -> Optional[int | str];
+    # emit(event, data) 用于 Web/CLI 事件推送
     ask: Optional[Callable[[str], bool]] = None
+    choose: Optional[Callable[[str, list[str]], Optional[int | str]]] = None
     emit: Optional[Callable[[str, dict], None]] = None
 
     def resolve(self, p: str | Path) -> Path:

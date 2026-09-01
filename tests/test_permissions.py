@@ -22,6 +22,15 @@ def test_layer1_tool_rules(tmp_path: Path):
     assert p.decide("Glob", {"pattern": "*"}).decision == Decision.ASK
 
 
+def test_ask_user_always_allowed(tmp_path: Path):
+    """ask_user 是用户交互通道:任何模式下都不触发权限确认(显式 deny 仍优先)。"""
+    args = {"prompt": "p", "options": ["a", "b"]}
+    for mode in ("interactive", "auto-approve", "deny"):
+        assert policy(tmp_path, mode).decide("ask_user", args).decision == Decision.ALLOW
+    # 显式拒绝名单仍生效
+    assert policy(tmp_path, deny_tools=["ask_user"]).decide("ask_user", args).decision == Decision.DENY
+
+
 def test_layer2_sensitive_path(tmp_path: Path):
     p = policy(tmp_path)
     assert p.decide("ReadFile", {"path": str(tmp_path / ".git" / "config")}).decision == Decision.DENY

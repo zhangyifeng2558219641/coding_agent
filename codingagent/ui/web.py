@@ -41,6 +41,11 @@ _ASKS: dict[str, dict[str, dict[str, Any]]] = {}
 # ask 超时(秒):超时未响应按拒绝处理,避免 worker 线程永久挂起
 _ASK_TIMEOUT = 600
 
+# 待用户选择注册表(供 /api/choose 回填答案)
+# conversation_id -> {qid: {"event": threading.Event, "answer": int|str|None}}
+_CHOOSES: dict[str, dict[str, dict[str, Any]]] = {}
+_CHOOSE_TIMEOUT = 600
+
 
 # ---------------------------------------------------------------------------
 # 会话存储
@@ -148,6 +153,33 @@ class SSEUI(UISink):
                 bucket.pop(qid, None)
                 if not bucket:
                     _ASKS.pop(self._cid, None)
+
+    def choose(self, prompt: str, options: list[str]) -> Optional[int | str]:
+        """交互选择:发出 choose 事件后阻塞等待用户经 /api/choose 回答。
+
+        返回选中索引(>=0)、-1(取消/超时/停止)或用户自定义文本;
+        无 cid(未接 Web 通道)返回 None。
+        """
+        if not self._cid:
+            return None
+        qid = uuid.uuid4().hex[:8]
+        entry = {"event": threading.Event(), "answer": None}
+        _CHOOSES.setdefault(self._cid, {})[qid] = entry
+        self._emit("choose", {"id": qid, "prompt": prompt, "options": list(options)})
+        try:
+            deadline = time.monotonic() + _CHOOSE_TIMEOUT
+            while not entry["event"].wait(0.2):
+                if self._stop_event is not None and self._stop_event.is_set():
+                    return -1
+                if time.monotonic() >= deadline:
+                    return -1
+            return entry["answer"]
+        finally:
+            bucket = _CHOOSES.get(self._cid)
+            if bucket:
+                bucket.pop(qid, None)
+                if not bucket:
+                    _CHOOSES.pop(self._cid, None)
 
 
 def _sse(type: str, data: dict[str, Any]) -> str:
@@ -421,6 +453,9 @@ def create_app(session: Session) -> FastAPI:
         for entry in _ASKS.pop(cid, {}).values():
             entry["answer"] = False
             entry["event"].set()
+        for entry in _CHOOSES.pop(cid, {}).values():
+            entry["answer"] = -1
+            entry["event"].set()
         entry = _RUNNING.get(cid)
         if not entry or entry.get("agent") is None:
             return {"ok": False, "reason": "无进行中的任务"}
@@ -439,6 +474,23 @@ def create_app(session: Session) -> FastAPI:
         if not entry:
             return {"ok": False}
         entry["answer"] = bool((body or {}).get("allow", False))
+        entry["event"].set()
+        return {"ok": True}
+
+    @app.post("/api/choose")
+    def choose(body: dict[str, Any]):
+        """回填某个待用户选择问题的答案(Web 输入框上方的选项条)。"""
+        cid = (body or {}).get("conversation_id", "")
+        qid = (body or {}).get("id", "")
+        entry = _CHOOSES.get(cid, {}).get(qid)
+        if not entry:
+            return {"ok": False}
+        if "index" in body:
+            entry["answer"] = int(body["index"])
+        elif body.get("text") is not None:
+            entry["answer"] = str(body["text"])
+        else:
+            entry["answer"] = -1
         entry["event"].set()
         return {"ok": True}
 
@@ -546,6 +598,23 @@ _INDEX_HTML = """<!DOCTYPE html>
                         cursor:pointer; color:var(--on-accent); flex-shrink:0; }
   #askAllow { background:var(--ok); }
   #askDeny { background:var(--err); }
+  /* ---- 输入框上方的选项条(ask_user 交互选择) ---- */
+  #chooseBar { background:var(--panel2); border:1px solid var(--accent); border-radius:8px;
+               padding:8px 12px; font-size:12px; display:flex; flex-direction:column; gap:8px; }
+  #chooseBar.hidden { display:none; }
+  #choosePrompt { color:var(--text); word-break:break-all; white-space:pre-wrap; }
+  #chooseOptions { display:flex; flex-wrap:wrap; gap:6px; }
+  #chooseOptions .co { border:1px solid var(--border); background:var(--panel); color:var(--text);
+                       border-radius:6px; padding:5px 12px; font-size:12px; cursor:pointer; }
+  #chooseOptions .co:hover { border-color:var(--accent); background:var(--accent); color:var(--on-accent); }
+  #chooseOther { display:flex; gap:8px; align-items:center; }
+  #chooseText { flex:1; background:var(--panel); border:1px solid var(--border); color:var(--text);
+                border-radius:6px; padding:5px 10px; font-size:12px; outline:none; }
+  #chooseText:focus { border-color:var(--accent); }
+  #chooseSubmit, #chooseCancel { border:none; border-radius:6px; padding:5px 12px; font-size:12px;
+                                 cursor:pointer; color:var(--on-accent); flex-shrink:0; }
+  #chooseSubmit { background:var(--accent); }
+  #chooseCancel { background:var(--err); }
   /* ---- 斜杠命令自动补全 ---- */
   #slashMenu { background:var(--panel); border:1px solid var(--border); border-radius:8px;
                max-height:220px; overflow-y:auto; font-size:12px; }
@@ -620,6 +689,15 @@ _INDEX_HTML = """<!DOCTYPE html>
       <button id="askAllow">允许</button>
       <button id="askDeny">拒绝</button>
     </div>
+    <div id="chooseBar" class="hidden">
+      <span id="choosePrompt"></span>
+      <div id="chooseOptions"></div>
+      <div id="chooseOther">
+        <input id="chooseText" placeholder="其他 / 自定义输入,回车提交"/>
+        <button id="chooseSubmit">提交</button>
+        <button id="chooseCancel">取消</button>
+      </div>
+    </div>
     <div id="slashMenu" class="hidden"></div>
     <div id="inputRow">
       <textarea id="input" placeholder="输入任务,回车发送;Shift+Enter 换行;输入 / 弹出命令"/></textarea>
@@ -635,6 +713,7 @@ let state = { convs: [], cur: null, busy: false, permMode: "interactive" };
 let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
 let slashCommands = [], slashOpen = false, slashIndex = 0, slashItems = [];
 let askQueue = [];  // 待审批确认的 FIFO 队列(团队并行可能多个 pending)
+let chooseQueue = [];  // 待用户选择的 FIFO 队列(团队并行可能多个 pending)
 
 async function api(path, opts={}) {
   const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
@@ -669,7 +748,7 @@ async function refreshList() {
 async function openConv(id) {
   state.cur = id;
   refreshList();
-  clearAskBar(); closeSlashMenu();
+  clearAskBar(); clearChooseBar(); closeSlashMenu();
   currentMsg = null; currentBubble = null; roundStart = false;
   try {
     const data = await api("/api/conversations/" + id);
@@ -750,6 +829,39 @@ async function respondAsk(allow) {
       body: JSON.stringify({conversation_id: state.cur, id: q.id, allow})});
   } catch(e) {}
   renderAskBar();
+}
+
+// ---- 选项条(agent 调用 ask_user 让用户选择方向时弹出) ----
+function renderChooseBar() {
+  const bar = $("chooseBar");
+  if (!chooseQueue.length) { bar.classList.add("hidden"); return; }
+  const q = chooseQueue[0];
+  $("choosePrompt").textContent = q.prompt;
+  const box = $("chooseOptions"); box.innerHTML = "";
+  (q.options || []).forEach((opt, i) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "co"; b.textContent = opt;
+    b.onclick = () => respondChoose(i, null);
+    box.appendChild(b);
+  });
+  $("chooseText").value = "";
+  bar.classList.remove("hidden");
+}
+function clearChooseBar() {
+  chooseQueue = [];
+  renderChooseBar();
+}
+async function respondChoose(index, text) {
+  if (!chooseQueue.length) return;
+  const q = chooseQueue.shift();
+  const body = {conversation_id: state.cur, id: q.id};
+  if (index !== null && index !== undefined && index >= 0) body.index = index;
+  else if (text !== null && text !== undefined && text !== "") body.text = text;
+  else body.index = -1;
+  try {
+    await api("/api/choose", {method:"POST", body: JSON.stringify(body)});
+  } catch(e) {}
+  renderChooseBar();
 }
 
 // ---- 自写 Markdown 渲染 + 代码高亮(零外部依赖;所有文本先转义,杜绝注入) ----
@@ -1033,8 +1145,12 @@ function handleEvent(ev, wrap) {
       askQueue.push({id: d.id, question: d.question});
       renderAskBar();
       break;
-    case "error": clearAskBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
-    case "done": clearAskBar(); refreshList(); break;
+    case "choose":
+      chooseQueue.push({id: d.id, prompt: d.prompt, options: d.options});
+      renderChooseBar();
+      break;
+    case "error": clearAskBar(); clearChooseBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
+    case "done": clearAskBar(); clearChooseBar(); refreshList(); break;
   }
   scheduleFlush();
 }
@@ -1042,7 +1158,7 @@ function handleEvent(ev, wrap) {
 async function stopGenerate() {
   if (!aborter) return;
   $("stop").disabled = true; $("stop").textContent = "停止中…";
-  clearAskBar();
+  clearAskBar(); clearChooseBar();
   // 先让后端 agent 尽快中断(置位 stop_event),再中止前端 fetch,双保险
   try { await api("/api/stop", {method:"POST", body: JSON.stringify({conversation_id: state.cur})}); }
   catch(e) {}
@@ -1071,6 +1187,11 @@ $("slashMenu").onclick = e => {
 };
 $("askAllow").onclick = () => respondAsk(true);
 $("askDeny").onclick = () => respondAsk(false);
+$("chooseSubmit").onclick = () => respondChoose(null, $("chooseText").value.trim());
+$("chooseCancel").onclick = () => respondChoose(-1, null);
+$("chooseText").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); respondChoose(null, $("chooseText").value.trim()); }
+});
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };
 $("exportSel").onchange = e => {

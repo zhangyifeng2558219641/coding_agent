@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from codingagent.tools import (
-    Bash, EditFile, Glob, Grep, ReadFile, ToolContext, WriteFile, default_registry,
+    AskUser, Bash, EditFile, Glob, Grep, ReadFile, ToolContext, WriteFile,
+    default_registry,
 )
 from codingagent.tools.shell import _find_bash
 
@@ -57,7 +58,8 @@ def test_registry():
     reg = default_registry(with_memory=True, with_agent_tools=True)
     names = reg.names()
     for n in ["ReadFile", "WriteFile", "EditFile", "Bash", "Glob", "Grep",
-              "WebSearch", "MemoryRecall", "MemorySave", "DispatchTask"]:
+              "WebSearch", "MemoryRecall", "MemorySave", "DispatchTask",
+              "ask_user"]:
         assert n in names, n
     schemas = reg.schemas()
     assert all(s["type"] == "function" for s in schemas)
@@ -126,3 +128,38 @@ def test_grep(workspace):
 def test_grep_fixed_and_glob(workspace):
     r = Grep().run(make_ctx(workspace), pattern="def foo", fixed_strings=True, glob="*.py")
     assert r.success and "a.py" in r.output
+
+
+def test_ask_user_select(workspace):
+    ctx = ToolContext(workspace=workspace, cwd=workspace, choose=lambda p, o: 1)
+    r = AskUser().run(ctx, prompt="选哪个方向?", options=["A", "B", "C"])
+    assert r.success
+    assert "B" in r.output  # 选中第 2 项
+
+
+def test_ask_user_custom(workspace):
+    ctx = ToolContext(workspace=workspace, cwd=workspace, choose=lambda p, o: "自定义xx")
+    r = AskUser().run(ctx, prompt="?", options=["A", "B"])
+    assert r.success
+    assert "自定义xx" in r.output
+
+
+def test_ask_user_cancel(workspace):
+    ctx = ToolContext(workspace=workspace, cwd=workspace, choose=lambda p, o: -1)
+    r = AskUser().run(ctx, prompt="?", options=["A", "B"])
+    assert r.success
+    assert "取消" in r.output
+
+
+def test_ask_user_no_ui(workspace):
+    """UI 未实现 choose(返回 None)→ 工具失败,模型自行兜底。"""
+    ctx = make_ctx(workspace)
+    r = AskUser().run(ctx, prompt="?", options=["A", "B"])
+    assert not r.success
+    assert "不支持" in r.error
+
+
+def test_ask_user_bad_options(workspace):
+    ctx = ToolContext(workspace=workspace, cwd=workspace, choose=lambda p, o: 0)
+    assert not AskUser().run(ctx, prompt="?", options=[]).success
+    assert not AskUser().run(ctx, prompt="?", options=["", "  "]).success

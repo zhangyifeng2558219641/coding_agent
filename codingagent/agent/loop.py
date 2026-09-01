@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ..llm import ChatClient, LLMError, StreamEvent
 from ..llm.history import History
@@ -36,11 +36,13 @@ class UISink:
         """交互确认;无交互能力时返回 False(默认拒绝)。"""
         return False
 
-    def choose(self, prompt: str, options: list[str]) -> Optional[int]:
-        """让用户在选项中挑选,返回 0-based 索引。
+    def choose(self, prompt: str, options: list[str]) -> Optional[Union[int, str]]:
+        """让用户在选项中挑选或输入自定义文本。
 
-        None:当前 UI 不支持交互选择(调用方应自行兜底,如恢复最新);
-        -1:用户取消;其余为选中索引。
+        None:当前 UI 不支持交互选择(调用方应自行兜底);
+        -1:用户取消;
+        int(>=0):选中 options[idx];
+        str:用户输入的自定义文本。
         """
         return None
 
@@ -289,6 +291,7 @@ class AgentLoop:
             llm=self.client,
             registry=self.registry,
             ask=self.ui.ask,
+            choose=self.ui.choose,
             emit=lambda t, d: self.ui.event(t, d),
         )
 

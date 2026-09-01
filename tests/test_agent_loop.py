@@ -135,6 +135,36 @@ def test_loop_termination_max_iterations(workspace: Path):
     assert result.iterations <= 3
 
 
+def test_loop_ask_user_feeds_choice_back(workspace: Path):
+    """agent 调 ask_user 工具 → UI.choose 返回用户选择 → 选择以工具结果回灌,模型继续。"""
+    from codingagent.agent.loop import UISink
+
+    class PickingUI(UISink):
+        def __init__(self):
+            self.calls: list = []
+
+        def choose(self, prompt, options):
+            self.calls.append((prompt, list(options)))
+            return 1  # 选第 2 项
+
+    ui = PickingUI()
+    agent = make_agent(
+        make_config(workspace), workspace,
+        [
+            ("有两个方案。", [ToolCall(id="1", name="ask_user",
+                                       arguments={"prompt": "选哪个方案?",
+                                                  "options": ["方案A", "方案B"]})]),
+            ("好,按你选的继续。", []),
+        ],
+        ui=ui,
+    )
+    result = agent.run("帮我决策")
+    assert result.success
+    assert "按你选的继续" in result.text
+    assert ui.calls and ui.calls[0][0] == "选哪个方案?" and ui.calls[0][1] == ["方案A", "方案B"]
+    assert agent.tool_history == [{"name": "ask_user", "status": "ok"}]
+
+
 def _make_agent_with_history(config, workspace, history, client):
     from codingagent.agent.loop import AgentLoop
     from codingagent.agent.permissions import PermissionPolicy

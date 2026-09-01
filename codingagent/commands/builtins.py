@@ -239,8 +239,10 @@ def _resume(ctx, args: str) -> str:
             latest = files[0]
         elif picked == -1:
             return "(已取消恢复)"
-        else:
+        elif isinstance(picked, int):
             latest = files[picked]
+        else:
+            return "(已取消恢复)"
     else:
         latest = files[0]
 

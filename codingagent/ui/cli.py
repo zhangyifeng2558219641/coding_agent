@@ -106,16 +106,21 @@ class CLIUI(UISink):
             if a in ("n", "no", "否", "拒绝"):
                 return False
 
-    def choose(self, prompt: str, options: list[str]) -> Optional[int]:
-        """交互选择:打印编号列表并等待输入,返回 0-based 索引或 -1(取消)。"""
+    def choose(self, prompt: str, options: list[str]) -> Optional[int | str]:
+        """交互选择:打印编号列表(含「其他/自定义」)并等待输入。
+
+        返回 0-based 索引、-1(取消),或用户输入的自定义文本。
+        """
         self._end_text()
         console = self.console
         console.print(prompt)
         for i, opt in enumerate(options, 1):
             console.print(f"  [{i}] {opt}")
+        other = len(options) + 1
+        console.print(f"  [{other}] 其他(自行输入)")
         while True:
             try:
-                ans = console.input("[yellow]请选择编号(0 取消): [/yellow]")
+                ans = console.input(f"[yellow]请选择编号(0 取消,{other} 其他): [/yellow]")
             except (EOFError, KeyboardInterrupt):
                 return -1
             ans = ans.strip()
@@ -128,7 +133,13 @@ class CLIUI(UISink):
                 continue
             if 1 <= n <= len(options):
                 return n - 1
-            console.print(f"(编号需在 1-{len(options)} 之间)", style="dim")
+            if n == other:
+                try:
+                    txt = console.input("[yellow]请输入你的选择: [/yellow]")
+                except (EOFError, KeyboardInterrupt):
+                    return -1
+                return txt.strip() if txt.strip() else -1
+            console.print(f"(编号需在 1-{other} 之间)", style="dim")
 
 
 def _read_multiline(console: Console) -> str:

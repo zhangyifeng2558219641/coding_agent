@@ -107,6 +107,40 @@ async def chat_with_ask(c, cid, message, allow):
     return await asyncio.wait_for(task, timeout=5)
 
 
+async def chat_with_choose(c, cid, message, index=None, text=None):
+    """后台跑 /api/chat,轮询 _CHOOSES 注册表见到 pending 即回 /api/choose。
+
+    与 chat_with_ask 同理:ASGITransport 缓冲整段响应,改为后台任务读 body +
+    主流程轮询注册表定位 qid 再解锁。index / text 二选一,均缺省视为取消。
+    """
+    import codingagent.ui.web as webmod
+
+    async def run_chat():
+        async with c.stream("POST", "/api/chat",
+                            json={"conversation_id": cid, "message": message}) as r:
+            return (await r.aread()).decode("utf-8")
+
+    task = asyncio.create_task(run_chat())
+    qid = None
+    for _ in range(200):
+        bucket = webmod._CHOOSES.get(cid) or {}
+        if bucket:
+            qid = next(iter(bucket))
+            break
+        await asyncio.sleep(0.02)
+    if qid is None:
+        task.cancel()
+        raise AssertionError("未收到 choose 事件(注册表无 pending)")
+    payload = {"conversation_id": cid, "id": qid}
+    if index is not None:
+        payload["index"] = index
+    elif text is not None:
+        payload["text"] = text
+    rr = await c.post("/api/choose", json=payload)
+    assert rr.status_code == 200
+    return await asyncio.wait_for(task, timeout=5)
+
+
 def test_web_health_and_config(tmp_path: Path):
     session = make_client_session(tmp_path, [])
     app = create_app(session)
@@ -506,5 +540,99 @@ def test_web_stop_clears_pending_asks(tmp_path: Path):
                 assert cid not in webmod._ASKS
             finally:
                 webmod._ASKS.pop(cid, None)
+
+    run(go())
+
+
+def _ask_user_script(prompt="选哪个方案?", options=("方案A", "方案B")):
+    return [
+        ("有两个方向。", [ToolCall(id="1", name="ask_user",
+                                   arguments={"prompt": prompt, "options": options})]),
+        ("好,按选择继续。", []),
+    ]
+
+
+def test_web_choose_select(tmp_path: Path):
+    """agent 调 ask_user → 弹选项条 → 用户点选第 2 项 → 选择回灌并正常收尾。"""
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, _ask_user_script())
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            body = await chat_with_choose(c, cid, "帮我选方案", index=1)
+            assert "event: choose" in body and "event: done" in body
+            assert "用户从选项中选择:方案B" in body  # 工具结果回灌
+            assert cid not in webmod._CHOOSES  # 选择完成后注册表已清空
+
+    run(go())
+
+
+def test_web_choose_custom(tmp_path: Path):
+    """用户经「其他/自定义」输入文本 → 文本回灌给模型。"""
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, _ask_user_script())
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            body = await chat_with_choose(c, cid, "帮我选方案", text="自定义方案C")
+            assert "event: choose" in body and "event: done" in body
+            assert "用户选择了「其他/自定义」:自定义方案C" in body
+            assert cid not in webmod._CHOOSES
+
+    run(go())
+
+
+def test_web_choose_cancel(tmp_path: Path):
+    """用户点「取消」→ 工具结果提示取消,流正常收尾。"""
+    session = make_client_session(tmp_path, _ask_user_script())
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            body = await chat_with_choose(c, cid, "帮我选方案", index=-1)
+            assert "event: choose" in body and "event: done" in body
+            assert "用户取消了本次选择" in body
+
+    run(go())
+
+
+def test_web_respond_choose_unknown(tmp_path: Path):
+    """/api/choose 指向不存在的选择 → ok False。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.post("/api/choose",
+                             json={"conversation_id": "x", "id": "nope", "index": 0})
+            assert r.json() == {"ok": False}
+
+    run(go())
+
+
+def test_web_stop_clears_pending_chooses(tmp_path: Path):
+    """/api/stop 解除并清理该会话所有待选择阻塞。"""
+    import threading
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = "fakechoose"
+            ev = threading.Event()
+            webmod._CHOOSES[cid] = {"q1": {"event": ev, "answer": None}}
+            try:
+                r = await c.post("/api/stop", json={"conversation_id": cid})
+                assert r.json()["ok"] is False  # 无进行中的任务,但待选择已清理
+                assert ev.is_set()
+                assert cid not in webmod._CHOOSES
+            finally:
+                webmod._CHOOSES.pop(cid, None)
 
     run(go())

@@ -95,9 +95,12 @@ class PermissionPolicy:
         args = args or {}
         name = tool_name
 
-        # 层1:工具级规则
+        # 层1:工具级规则(显式 deny 名单优先)
         if name in self.deny_tools:
             return PermissionDecision(Decision.DENY, f"工具 {name} 在拒绝名单中", 1)
+        # ask_user 是用户交互通道,其余一律放行,避免 interactive 模式自我确认
+        if name == "ask_user":
+            return PermissionDecision(Decision.ALLOW, "ask_user 为交互选择工具,始终放行", 0)
         if name in self.allow_tools:
             return PermissionDecision(Decision.ALLOW, f"工具 {name} 在白名单中", 1)
         if name in self.ask_tools:
