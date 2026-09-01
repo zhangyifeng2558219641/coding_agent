@@ -56,6 +56,8 @@ class ChatBody(BaseModel):
     message: str
     permission_mode: Optional[str] = None
     model: Optional[str] = None
+    # 编辑重发:截断到该历史索引(丢弃其及之后的消息)再追加新消息
+    resend_at: Optional[int] = None
 
 
 class ConversationStore:
@@ -369,6 +371,10 @@ def create_app(session: Session) -> FastAPI:
                 max_tool_output=session.config.context.get("max_tool_output", 30000),
             )
 
+        # 编辑重发:截断到该历史索引(丢弃被编辑消息及其之后),再追加新消息
+        if body.resend_at is not None and 0 <= body.resend_at < len(history.messages):
+            history.messages = history.messages[:body.resend_at]
+
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
         # 每个请求独立停止信号;agent 创建后挂上去,Web「停止生成」/跳转页面都会中止
@@ -546,6 +552,10 @@ _INDEX_HTML = """<!DOCTYPE html>
   #sidebar h1 span { color:var(--accent); }
   #newBtn { margin:0 12px 10px; padding:9px; background:var(--accent); border:none; border-radius:8px;
             color:var(--on-accent); font-size:13px; cursor:pointer; }
+  #search { margin:0 12px 10px; padding:8px 10px; background:var(--panel2); color:var(--text);
+            border:1px solid var(--border); border-radius:8px; font-size:12px; outline:none; box-sizing:border-box; }
+  #search:focus { border-color:var(--accent); }
+  #search::placeholder { color:var(--dim); }
   #convList { flex:1; overflow-y:auto; }
   .conv { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px;
           color:var(--dim); display:flex; justify-content:space-between; align-items:center; }
@@ -563,8 +573,11 @@ _INDEX_HTML = """<!DOCTYPE html>
   .msg { margin-bottom:16px; max-width:100%; }
   .msg .bubble { padding:10px 14px; border-radius:10px; white-space:pre-wrap; word-break:break-word;
                  font-size:14px; line-height:1.55; }
-  .msg.user { text-align:right; }
+  .msg.user { display:flex; justify-content:flex-end; align-items:center; gap:6px; }
   .msg.user .bubble { background:var(--accent); color:var(--on-accent); display:inline-block; text-align:left; }
+  .ubtn { border:none; background:none; color:var(--dim); cursor:pointer; font-size:12px; opacity:0; padding:4px; flex-shrink:0; }
+  .msg.user:hover .ubtn { opacity:1; }
+  .ubtn:hover { color:var(--accent); }
   .msg.assistant .bubble { background:var(--panel); border:1px solid var(--border); white-space:normal; }
   .msg.system .bubble { background:transparent; color:var(--dim); text-align:center; font-size:12px; }
   .toolcard { margin-top:8px; border:1px solid var(--border); border-left:3px solid var(--accent);
@@ -638,7 +651,11 @@ _INDEX_HTML = """<!DOCTYPE html>
   .msg.assistant .bubble code { font-family:Consolas,"Courier New",monospace; }
   .msg.assistant .bubble :not(pre) > code { background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:12.5px; color:var(--accent); }
   .msg.assistant .bubble pre.code { background:var(--panel2); border:1px solid var(--border); border-radius:8px; margin:8px 0; overflow:hidden; }
-  .msg.assistant .bubble pre.code .code-head { padding:4px 10px; font-size:11px; color:var(--dim); background:var(--panel); border-bottom:1px solid var(--border); }
+  .msg.assistant .bubble pre.code .code-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 10px; font-size:11px; color:var(--dim); background:var(--panel); border-bottom:1px solid var(--border); }
+  .msg.assistant .bubble pre.code .code-head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .copy-code { border:1px solid var(--border); border-radius:4px; padding:1px 8px; font-size:11px; color:var(--dim); background:var(--panel2); cursor:pointer; flex-shrink:0; }
+  .copy-code:hover { color:var(--accent); border-color:var(--accent); }
+  .copy-code.ok { color:#fff; background:var(--accent); border-color:var(--accent); }
   .msg.assistant .bubble pre.code code { display:block; padding:10px 12px; overflow-x:auto; font-family:Consolas,"Courier New",monospace; font-size:12.5px; line-height:1.55; white-space:pre; }
   .tok-kw{color:#c678dd;} .tok-s{color:#98c379;} .tok-n{color:#d19a66;} .tok-c{color:#7a8194;font-style:italic;} .tok-fn{color:#61afef;} .tok-de{color:#e5c07b;}
   html[data-theme="light"] .tok-kw{color:#8250df;} html[data-theme="light"] .tok-s{color:#1a7f37;}
@@ -652,6 +669,7 @@ _INDEX_HTML = """<!DOCTYPE html>
 <div id="sidebar">
   <h1>coding_agent <span>编程智能体</span></h1>
   <button id="newBtn">＋ 新建会话</button>
+  <input id="search" type="text" placeholder="搜索会话标题…" autocomplete="off">
   <div id="convList"></div>
   <div id="footer"></div>
 </div>
@@ -709,7 +727,8 @@ _INDEX_HTML = """<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
-let state = { convs: [], cur: null, busy: false, permMode: "interactive" };
+let state = { convs: [], cur: null, busy: false, permMode: "interactive", search: "",
+              resendAt: null, turnOk: false, isSlash: false };
 let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
 let slashCommands = [], slashOpen = false, slashIndex = 0, slashItems = [];
 let askQueue = [];  // 待审批确认的 FIFO 队列(团队并行可能多个 pending)
@@ -730,8 +749,12 @@ async function refreshConfig() {
 }
 async function refreshList() {
   state.convs = await api("/api/conversations");
+  renderConvList();
+}
+function renderConvList() {
   const list = $("convList"); list.innerHTML = "";
-  state.convs.forEach(c => {
+  const q = (state.search || "").trim().toLowerCase();
+  state.convs.filter(c => !q || (c.title || "").toLowerCase().includes(q)).forEach(c => {
     const div = document.createElement("div");
     div.className = "conv" + (c.id === state.cur ? " active" : "");
     div.innerHTML = `<span class="t">${esc(c.title)}</span><button class="del">✕</button>`;
@@ -747,6 +770,7 @@ async function refreshList() {
 }
 async function openConv(id) {
   state.cur = id;
+  state.resendAt = null; state.turnOk = false; state.isSlash = false;
   refreshList();
   clearAskBar(); clearChooseBar(); closeSlashMenu();
   currentMsg = null; currentBubble = null; roundStart = false;
@@ -866,6 +890,7 @@ async function respondChoose(index, text) {
 
 // ---- 自写 Markdown 渲染 + 代码高亮(零外部依赖;所有文本先转义,杜绝注入) ----
 function mdEscape(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function mdAttr(s){ return mdEscape(s).replace(/"/g,"&quot;"); }
 const MD_LANG_TAGS = { python:"py", py:"py", javascript:"js", js:"js", typescript:"ts", ts:"ts",
   json:"json", yaml:"yaml", yml:"yaml", bash:"bash", sh:"bash", shell:"bash",
   sql:"sql", html:"html", xml:"html", css:"css", diff:"diff", text:"text", plaintext:"text" };
@@ -952,8 +977,12 @@ function mdRender(text) {
   const flushCode = () => {
     if (inCode) {
       const tag = MD_LANG_TAGS[codeLang] || "text";
-      const esc = mdEscape(codeBuf.join("\\n"));
-      html.push('<pre class="code"><div class="code-head">' + mdEscape(codeLang || tag) + '</div><code>' + mdHighlight(esc, codeLang) + '</code></pre>');
+      const raw = codeBuf.join("\\n");
+      const esc = mdEscape(raw);
+      html.push('<pre class="code" data-code="' + mdAttr(raw) + '">' +
+        '<div class="code-head"><span>' + mdEscape(codeLang || tag) + '</span>' +
+        '<button class="copy-code" type="button">复制</button></div>' +
+        '<code>' + mdHighlight(esc, codeLang) + '</code></pre>');
       codeBuf = []; codeLang = ""; inCode = false;
     }
   };
@@ -990,9 +1019,16 @@ function mdRender(text) {
   return html.join("\\n");
 }
 
-function addMsg(role, text) {
+function addMsg(role, text, idx) {
   const m = document.createElement("div");
   m.className = "msg " + role;
+  if (idx != null) m.dataset.idx = idx;
+  if (role === "user") {
+    const u = document.createElement("button");
+    u.className = "ubtn"; u.title = "编辑并重发"; u.type = "button"; u.textContent = "✎";
+    u.onclick = () => editMessage(m);
+    m.appendChild(u);
+  }
   const b = document.createElement("div"); b.className = "bubble";
   if (role === "assistant") b.innerHTML = mdRender(text);
   else b.textContent = text;
@@ -1013,11 +1049,14 @@ function addToolCard(parent, name, args, output, status) {
 }
 function renderMessages(messages) {
   const wrap = $("messages"); wrap.innerHTML = "";
+  let i = 0;
   (messages||[]).forEach(m => {
-    if (m.role === "user") addMsg("user", m.content || "");
+    if (m.role === "system") return;
+    const idx = i++;
+    if (m.role === "user") addMsg("user", m.content || "", idx);
     else if (m.role === "assistant") {
       const hasTools = !!(m.tool_calls && m.tool_calls.length);
-      const msg = addMsg("assistant", m.content || (hasTools ? "(调用工具)" : ""));
+      const msg = addMsg("assistant", m.content || (hasTools ? "(调用工具)" : ""), idx);
       if (hasTools) m.tool_calls.forEach(tc => addToolCard(msg, tc.function.name, tc.function.arguments, "", ""));
     } else if (m.role === "tool") {
       const last = wrap.querySelector(".toolcard:last-of-type");
@@ -1025,6 +1064,46 @@ function renderMessages(messages) {
                   last.querySelector(".tb").textContent += "\\n\\n" + m.content; }
     }
   });
+}
+
+function editMessage(m) {
+  const idx = +m.dataset.idx;
+  if (Number.isNaN(idx) || state.busy) return;
+  state.resendAt = idx;
+  const bubble = m.querySelector(".bubble");
+  const input = $("input");
+  input.value = (bubble ? bubble.textContent : "");
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+async function reloadMessages() {
+  if (!state.cur) return;
+  try {
+    const data = await api("/api/conversations/" + state.cur);
+    $("messages").innerHTML = "";
+    renderMessages(data.messages);
+  } catch(e) {}
+}
+
+function copyCode(btn) {
+  const pre = btn.closest("pre.code");
+  const text = pre ? (pre.dataset.code || "") : "";
+  const ok = () => {
+    const old = btn.textContent;
+    btn.textContent = "已复制"; btn.classList.add("ok");
+    setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1200);
+  };
+  const fallback = () => {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); ok(); } catch(e) {}
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok, fallback);
+  } else fallback();
 }
 
 function parseSSE(data) {
@@ -1080,6 +1159,15 @@ async function send() {
   const text = $("input").value.trim();
   if (!text || state.busy) return;
   if (!state.cur) await newConv();
+  // 编辑重发:先把被编辑消息及其后所有已持久化节点从 DOM 移除
+  if (state.resendAt != null) {
+    [...$("messages").children].forEach(n => {
+      const i = n.dataset.idx !== undefined ? +n.dataset.idx : -1;
+      if (i >= state.resendAt) n.remove();
+    });
+  }
+  const resend_at = state.resendAt;
+  state.resendAt = null; state.isSlash = false; state.turnOk = false;
   $("input").value = ""; state.busy = true; $("send").disabled = true;
   $("stop").disabled = false; $("stop").textContent = "停止";
   $("stop").classList.remove("hidden");
@@ -1093,7 +1181,8 @@ async function send() {
     const resp = await fetch("/api/chat", {method:"POST",
       headers:{"Content-Type":"application/json"},
       signal: aborter.signal,
-      body: JSON.stringify({conversation_id: state.cur, message: text, permission_mode: state.permMode})});
+      body: JSON.stringify({conversation_id: state.cur, message: text, permission_mode: state.permMode,
+                            resend_at: resend_at})});
     const reader = resp.body.getReader(); const dec = new TextDecoder();
     while (true) {
       const {done, value} = await reader.read();
@@ -1149,8 +1238,19 @@ function handleEvent(ev, wrap) {
       chooseQueue.push({id: d.id, prompt: d.prompt, options: d.options});
       renderChooseBar();
       break;
+    case "meta":
+      if (d.type === "slash") state.isSlash = true;
+      break;
+    case "turn_end":
+      state.turnOk = !!d.success;
+      break;
     case "error": clearAskBar(); clearChooseBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
-    case "done": clearAskBar(); clearChooseBar(); refreshList(); break;
+    case "done":
+      clearAskBar(); clearChooseBar();
+      // 成功且非斜杠命令 → 从持久化历史整体重渲染,让消息节点带真实索引(编辑重发依赖)
+      if (state.turnOk && !state.isSlash) reloadMessages();
+      refreshList();
+      break;
   }
   scheduleFlush();
 }
@@ -1165,6 +1265,10 @@ async function stopGenerate() {
   if (aborter) aborter.abort();
 }
 $("stop").onclick = stopGenerate;
+$("messages").addEventListener("click", e => {
+  const b = e.target.closest(".copy-code");
+  if (b) copyCode(b);
+});
 $("send").onclick = send;
 $("input").addEventListener("keydown", e => {
   if (slashOpen) {
@@ -1191,6 +1295,10 @@ $("chooseSubmit").onclick = () => respondChoose(null, $("chooseText").value.trim
 $("chooseCancel").onclick = () => respondChoose(-1, null);
 $("chooseText").addEventListener("keydown", e => {
   if (e.key === "Enter") { e.preventDefault(); respondChoose(null, $("chooseText").value.trim()); }
+});
+$("search").addEventListener("input", e => {
+  state.search = e.target.value;
+  renderConvList();
 });
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };

@@ -636,3 +636,48 @@ def test_web_stop_clears_pending_chooses(tmp_path: Path):
                 webmod._CHOOSES.pop(cid, None)
 
     run(go())
+
+
+def test_web_chat_resend_at_truncates(tmp_path: Path):
+    """编辑重发:resend_at 截断历史后追加新消息,旧回复不再出现。"""
+    session = make_client_session(tmp_path, [
+        ("回复1", []),
+        ("回复2", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "你好"})
+            # 编辑第 1 条用户消息(索引 1 之后截断)重发
+            await c.post("/api/chat",
+                         json={"conversation_id": cid, "message": "你好2", "resend_at": 1})
+            got = (await c.get(f"/api/conversations/{cid}")).json()
+            roles = [m["role"] for m in got["messages"]]
+            assert roles == ["user", "user", "assistant"]
+            contents = "|".join(m.get("content", "") for m in got["messages"])
+            assert "你好2" in contents and "回复2" in contents
+            assert "回复1" not in contents
+
+    run(go())
+
+
+def test_web_chat_resend_at_ignored_invalid(tmp_path: Path):
+    """resend_at 越界/负数为 no-op,历史原样保留。"""
+    session = make_client_session(tmp_path, [("回复1", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            await c.post("/api/chat", json={"conversation_id": cid, "message": "你好"})
+            for bad in (-1, 99):
+                await c.post("/api/chat",
+                             json={"conversation_id": cid, "message": "追加", "resend_at": bad})
+            got = (await c.get(f"/api/conversations/{cid}")).json()
+            contents = "|".join(m.get("content", "") for m in got["messages"])
+            assert contents.count("你好") == 1
+            assert contents.count("追加") == 2
+
+    run(go())
