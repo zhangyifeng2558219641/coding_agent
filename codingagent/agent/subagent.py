@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,7 @@ class SubAgent:
         allow_tools: Optional[list[str]] = None,
         permissions: Optional[PermissionPolicy] = None,
         ui: Optional[UISink] = None,
+        stop_event: Optional[threading.Event] = None,
     ):
         self.config = config
         self.name = name
@@ -57,6 +59,7 @@ class SubAgent:
                 system_prompt=system_prompt or _default_sub_prompt(name),
                 allow_tools=allow_tools,
             ),
+            stop_event=stop_event,
         )
 
     def run(self, task: str) -> SubAgentResult:

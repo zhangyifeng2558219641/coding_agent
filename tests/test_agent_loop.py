@@ -243,3 +243,31 @@ def test_loop_empty_response_exhausts_retries(workspace: Path):
     result = agent.run("测试")
     assert not result.success
     assert "空响应" in result.error
+
+
+def test_loop_stop_event_breaks_early(workspace: Path):
+    """stop_event 预先置位时 run() 应在首轮即中断,不再消费脚本(不调用 LLM)。"""
+    import threading
+    config = make_config(workspace)
+    ev = threading.Event(); ev.set()
+    agent = make_agent(config, workspace, script=[("不该被消费", [])])
+    agent.stop_event = ev
+    result = agent.run("测试")
+    assert not result.success
+    assert result.error == "用户中断"
+    assert result.iterations == 0
+
+
+def test_loop_interrupt_sets_stop_event(workspace: Path):
+    """interrupt() 同时置位 stop_event:Web「停止生成」/团队并行共用同一信号。"""
+    import threading
+    config = make_config(workspace)
+    ev = threading.Event()
+    agent = make_agent(config, workspace, script=[("hi", [])])
+    agent.stop_event = ev
+    agent.interrupt()
+    assert agent._interrupted
+    assert ev.is_set()
+    result = agent.run("测试")
+    assert not result.success
+    assert result.error == "用户中断"

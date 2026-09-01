@@ -25,6 +25,14 @@ from ..session import Session
 
 
 # ---------------------------------------------------------------------------
+# 进行中的任务注册表(供 /api/stop 中断)
+# conversation_id → {"agent": AgentLoop 或 None, "stop_event": threading.Event}
+# ---------------------------------------------------------------------------
+
+_RUNNING: dict[str, dict[str, Any]] = {}
+
+
+# ---------------------------------------------------------------------------
 # 会话存储
 # ---------------------------------------------------------------------------
 
@@ -210,6 +218,9 @@ def create_app(session: Session) -> FastAPI:
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
         ui = SSEUI(lambda t, d: loop.call_soon_threadsafe(q.put_nowait, (t, d)))
+        # 每个请求独立停止信号;agent 创建后挂上去,Web「停止生成」/跳转页面都会中止
+        stop_event = threading.Event()
+        _RUNNING[body.conversation_id] = {"agent": None, "stop_event": stop_event}
 
         if body.message.startswith("/"):
             # 斜杠命令(尤其 /team 这类长任务)也在 worker 线程执行并实时下发队列事件,
@@ -220,12 +231,16 @@ def create_app(session: Session) -> FastAPI:
                 try:
                     agent = session.make_agent(history=history, ui=ui,
                                                permission_mode=body.permission_mode)
+                    agent.stop_event = stop_event
+                    _RUNNING[body.conversation_id]["agent"] = agent
                     ctx = session.context(agent)
                     slash_holder["resp"] = session.slash.run(
                         body.message[1:].partition(" ")[0],
                         body.message[1:].partition(" ")[2].strip(), ctx)
                 except Exception as e:  # pragma: no cover
                     slash_holder["error"] = str(e)
+                finally:
+                    _RUNNING.pop(body.conversation_id, None)
 
             async def slash_stream():
                 yield _sse("meta", {"type": "slash", "command": body.message})
@@ -247,12 +262,16 @@ def create_app(session: Session) -> FastAPI:
             try:
                 agent = session.make_agent(history=history, ui=ui,
                                            permission_mode=body.permission_mode)
+                agent.stop_event = stop_event
+                _RUNNING[body.conversation_id]["agent"] = agent
                 if body.model:
                     agent.client.model = body.model
                 result_holder["result"] = agent.run(body.message)
                 session.save_history(history, body.conversation_id)
             except Exception as e:  # pragma: no cover
                 result_holder["error"] = str(e)
+            finally:
+                _RUNNING.pop(body.conversation_id, None)
 
         async def stream():
             yield _sse("start", {"conversation_id": body.conversation_id})
@@ -271,6 +290,19 @@ def create_app(session: Session) -> FastAPI:
             })
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.post("/api/stop")
+    def stop(body: dict[str, Any]):
+        """中断指定会话进行中的生成(agent.interrupt() → stop_event 置位)。"""
+        cid = (body or {}).get("conversation_id", "")
+        entry = _RUNNING.get(cid)
+        if not entry or entry.get("agent") is None:
+            return {"ok": False, "reason": "无进行中的任务"}
+        try:
+            entry["agent"].interrupt()
+            return {"ok": True}
+        except Exception as e:  # pragma: no cover
+            return {"ok": False, "reason": str(e)}
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -362,6 +394,10 @@ _INDEX_HTML = """<!DOCTYPE html>
   #input:focus { border-color:var(--accent); }
   #send { width:70px; border:none; border-radius:10px; background:var(--accent); color:var(--on-accent); cursor:pointer; }
   #send:disabled { opacity:.5; cursor:not-allowed; }
+  #stop { width:70px; border:none; border-radius:10px; background:rgba(255,107,107,.15); color:var(--err); cursor:pointer; }
+  #stop:hover:not(:disabled) { background:rgba(255,107,107,.28); }
+  #stop:disabled { opacity:.5; cursor:not-allowed; }
+  #stop.hidden { display:none; }
   .badge { padding:2px 8px; border-radius:10px; font-size:11px; }
   .badge.ok { background:rgba(61,220,132,.15); color:var(--ok); }
   .badge.err { background:rgba(255,107,107,.15); color:var(--err); }
@@ -416,12 +452,14 @@ _INDEX_HTML = """<!DOCTYPE html>
   <div id="inputBar">
     <textarea id="input" placeholder="输入任务,回车发送;Shift+Enter 换行;/help 查看命令"></textarea>
     <button id="send">发送</button>
+    <button id="stop" class="hidden">停止</button>
   </div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
 let state = { convs: [], cur: null, busy: false, permMode: "interactive" };
+let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
 
 async function api(path, opts={}) {
   const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
@@ -688,14 +726,18 @@ async function send() {
   if (!text || state.busy) return;
   if (!state.cur) await newConv();
   $("input").value = ""; state.busy = true; $("send").disabled = true;
+  $("stop").disabled = false; $("stop").textContent = "停止";
+  $("stop").classList.remove("hidden");
   addMsg("user", text);
   currentMsg = null; currentBubble = null; roundStart = false;
   pendingBubble = null;
   const wrap = $("messages");
   let buf = "";
+  aborter = new AbortController();
   try {
     const resp = await fetch("/api/chat", {method:"POST",
       headers:{"Content-Type":"application/json"},
+      signal: aborter.signal,
       body: JSON.stringify({conversation_id: state.cur, message: text, permission_mode: state.permMode})});
     const reader = resp.body.getReader(); const dec = new TextDecoder();
     while (true) {
@@ -709,9 +751,15 @@ async function send() {
       }
     }
   } catch(e) {
-    ensureAssistantBubble(); currentBubble._md += "\\n请求失败: " + e.message; scheduleFlush();
+    if (e.name === "AbortError") {
+      ensureAssistantBubble(); currentBubble._md += "\\n⏹ 已停止生成"; scheduleFlush();
+    } else {
+      ensureAssistantBubble(); currentBubble._md += "\\n请求失败: " + e.message; scheduleFlush();
+    }
   }
   clearCursor(); state.busy = false; $("send").disabled = false;
+  $("stop").classList.add("hidden");
+  aborter = null;
 }
 
 function handleEvent(ev, wrap) {
@@ -744,6 +792,15 @@ function handleEvent(ev, wrap) {
   scheduleFlush();
 }
 
+async function stopGenerate() {
+  if (!aborter) return;
+  $("stop").disabled = true; $("stop").textContent = "停止中…";
+  // 先让后端 agent 尽快中断(置位 stop_event),再中止前端 fetch,双保险
+  try { await api("/api/stop", {method:"POST", body: JSON.stringify({conversation_id: state.cur})}); }
+  catch(e) {}
+  if (aborter) aborter.abort();
+}
+$("stop").onclick = stopGenerate;
 $("send").onclick = send;
 $("input").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }

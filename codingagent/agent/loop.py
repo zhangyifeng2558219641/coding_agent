@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,7 @@ class AgentLoop:
         ui: Optional[UISink] = None,
         hooks=None,
         options: Optional[AgentOptions] = None,
+        stop_event: Optional[threading.Event] = None,
     ):
         self.config = config
         self.workspace = workspace.resolve()
@@ -99,6 +101,8 @@ class AgentLoop:
         self._tool_history: list[dict[str, Any]] = []
         self._interrupted = False
         self._compact_count = 0
+        # 线程安全停止信号(Web「停止生成」用):interrupt() 或外部 set() 都会让主循环尽快退出
+        self.stop_event = stop_event
 
     # ------------------------------------------------------------------ 公共
     @property
@@ -115,8 +119,10 @@ class AgentLoop:
         return list(self.history.messages)
 
     def interrupt(self) -> None:
-        """供 UI 在用户 Ctrl+C 时调用,中断当前轮。"""
+        """供 UI 在用户 Ctrl+C / 点击停止时调用,中断当前轮。"""
         self._interrupted = True
+        if self.stop_event is not None:
+            self.stop_event.set()
 
     # ------------------------------------------------------------------ 主循环
     def run(self, user_text: str) -> FinalResult:
@@ -133,7 +139,7 @@ class AgentLoop:
 
         try:
             while iterations < self.options.max_iterations:
-                if self._interrupted:
+                if self._interrupted or (self.stop_event is not None and self.stop_event.is_set()):
                     last_error = "用户中断"
                     break
 
@@ -148,7 +154,8 @@ class AgentLoop:
                 calls: list[ToolCall] = []
                 try:
                     events = self.client.chat_stream(self.history.to_api(),
-                                                     self._schemas())
+                                                     self._schemas(),
+                                                     stop_event=self.stop_event)
                     for ev in events:
                         if ev.type == "text":
                             text_parts.append(ev.text)

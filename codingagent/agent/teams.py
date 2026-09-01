@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,7 @@ class Team:
         leader_prompt: str = "",
         permissions: Optional[PermissionPolicy] = None,
         ui=None,
+        stop_event: Optional[threading.Event] = None,
     ):
         self.name = name
         self.members = members
@@ -90,6 +92,8 @@ class Team:
         self.registry = registry
         self.permissions = permissions
         self.ui = ui
+        # 共享停止信号:Web「停止生成」置位后成员子 Agent 尽快退出
+        self.stop_event = stop_event
         self.leader_prompt = leader_prompt or (
             "你是团队负责人,负责把成员产出整合成一份完整、可执行、条理清晰的最终成果。"
             "成员产出可能有冲突或冗余,请去重、纠错并提炼。")
@@ -117,7 +121,8 @@ class Team:
             sub = SubAgent(self.config, self.workspace, client, self.registry,
                            name=m.name, system_prompt=m.role_prompt(),
                            allow_tools=m.allow_tools,
-                           permissions=self.permissions, ui=None)
+                           permissions=self.permissions, ui=None,
+                           stop_event=self.stop_event)
             r = sub.run(task)
             if ui:
                 state = "成功" if r.success else f"失败({r.error})"
@@ -135,6 +140,23 @@ class Team:
                 member_outputs.append(out)
                 usage += out["usage"]
         member_outputs.sort(key=lambda o: [m.name for m in self.members].index(o["name"]))
+
+        # 用户点了「停止生成」:跳过汇总、不写汇总文档,兜底展示成员已有产出
+        if self.stop_event is not None and self.stop_event.is_set():
+            result = TeamResult(final_text=_member_digest(task, member_outputs),
+                                success=False,
+                                members=[{k: v for k, v in o.items() if k != "usage"}
+                                         for o in member_outputs],
+                                usage=usage,
+                                error="用户已停止生成,未完成最终汇总。")
+            if ui:
+                ui.event("status", {"message": f"团队 {self.name} 已停止"})
+                ui.event("turn_end", {"final_text": result.final_text, "success": False,
+                                      "iterations": len(member_outputs),
+                                      "usage": {"prompt_tokens": usage.prompt_tokens,
+                                                "completion_tokens": usage.completion_tokens},
+                                      "error": result.error})
+            return result
 
         # 负责人汇总:prompt 已截断,空响应/异常重试一次(多为瞬时),仍失败则兜底展示成员产出
         if ui:

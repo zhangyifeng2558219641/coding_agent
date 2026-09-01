@@ -192,15 +192,22 @@ class ChatClient:
 
     # ------------------------------------------------------------------ 流式
     def chat_stream(self, messages: list[dict], tools: list[dict] | None = None,
-                    **kw: Any) -> Iterator[StreamEvent]:
-        """边收边吐:文本 delta 实时 yield,整轮结束前补发 tool_calls/finish。"""
+                    stop_event=None, **kw: Any) -> Iterator[StreamEvent]:
+        """边收边吐:文本 delta 实时 yield,整轮结束前补发 tool_calls/finish。
+
+        stop_event 置位时(Web「停止生成」/Ctrl+C 线程共享信号)尽早中止本轮:
+        关闭底层连接,以 error 事件收尾,让主循环及时退出。
+        """
+        if stop_event is not None and stop_event.is_set():
+            yield StreamEvent(type="error", message="用户中断")
+            return
         resp = self._do_request(messages, tools, stream=True, **kw)
         pending: dict[int, dict[str, str]] = {}
         usage_raw: Optional[dict[str, int]] = None
         finish_reason: Optional[str] = None
 
         try:
-            for raw in self._iter_sse(resp):
+            for raw in self._iter_sse(resp, stop_event):
                 if raw is None:
                     continue
                 if raw.get("usage"):
@@ -223,7 +230,14 @@ class ChatClient:
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
         except requests.RequestException as e:
+            # 关闭连接可能触发异常:若是用户主动停止则按中断处理,否则才报流式中断
+            if stop_event is not None and stop_event.is_set():
+                yield StreamEvent(type="error", message="用户中断")
+                return
             yield StreamEvent(type="error", message=f"流式中断: {e}")
+            return
+        if stop_event is not None and stop_event.is_set():
+            yield StreamEvent(type="error", message="用户中断")
             return
 
         calls = []
@@ -249,9 +263,12 @@ class ChatClient:
         yield StreamEvent(type="finish", reason=finish_reason, usage=usage)
 
     @staticmethod
-    def _iter_sse(resp: requests.Response) -> Iterator[Optional[dict[str, Any]]]:
-        """手写 SSE 解析:识别 data: 行与 [DONE]。"""
+    def _iter_sse(resp: requests.Response, stop_event=None) -> Iterator[Optional[dict[str, Any]]]:
+        """手写 SSE 解析:识别 data: 行与 [DONE];stop_event 置位时关闭连接并中止。"""
         for line in resp.iter_lines(decode_unicode=True):
+            if stop_event is not None and stop_event.is_set():
+                resp.close()  # 让底层读阻塞尽快返回,停止拉取本轮的剩余内容
+                break
             if not line:
                 continue
             if line.startswith(":"):  # 心跳注释行

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from codingagent.agent import AgentLoop, PermissionPolicy
 from codingagent.llm import ChatResponse, ChatClient, StreamEvent
 from codingagent.tools import default_registry
@@ -18,15 +20,56 @@ class FakeResp:
 
     def __init__(self, lines: list[str]):
         self._lines = lines
+        self.closed = False
 
     def iter_lines(self, decode_unicode: bool = True):
         yield from self._lines
+
+    def close(self):
+        self.closed = True
 
 
 def _make_client(fake: FakeResp) -> ChatClient:
     client = ChatClient(base_url="https://mock", api_key="k", model="mock")
     client._do_request = lambda *a, **k: fake  # 拦截真实网络
     return client
+
+
+def test_client_stream_stop_event_before_call():
+    """stop_event 预先置位:不发请求,直接以 error 事件收尾(Web「停止生成」尽早中断)。"""
+    seen = {"do_request": False}
+    client = ChatClient(base_url="https://mock", api_key="k", model="mock")
+    def fake_do_request(*a, **k):
+        seen["do_request"] = True
+        return FakeResp([])
+    client._do_request = fake_do_request
+    ev = threading.Event(); ev.set()
+    events = list(client.chat_stream([], [], stop_event=ev))
+    assert not seen["do_request"]
+    assert [e.type for e in events] == ["error"]
+    assert events[0].message == "用户中断"
+
+
+def test_client_stream_aborts_mid_stream_on_stop():
+    """流式中途置位 stop_event:关闭连接、立即以 error 收尾,不再拉取剩余内容。"""
+    lines = [
+        'data: {"choices":[{"index":0,"delta":{"content":"你好"}}]}',
+        'data: {"choices":[{"index":0,"delta":{"content":"世界"}}]}',
+        'data: {"choices":[{"index":0,"delta":{"content":"。"}}]}',
+        'data: [DONE]',
+    ]
+    resp = FakeResp(lines)
+    client = ChatClient(base_url="https://mock", api_key="k", model="mock")
+    client._do_request = lambda *a, **k: resp
+    ev = threading.Event()
+    gen = client.chat_stream([], [], stop_event=ev)
+    first = next(gen)
+    assert first.type == "text" and first.text == "你好"
+    ev.set()
+    rest = list(gen)
+    assert resp.closed                       # 底层连接被关闭
+    assert [e.type for e in rest] == ["error"]
+    assert rest[0].message == "用户中断"
 
 
 def test_two_parallel_tool_calls_interleaved():

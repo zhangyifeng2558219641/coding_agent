@@ -166,3 +166,50 @@ def test_index_served(tmp_path: Path):
             assert "coding_agent" in html
 
     run(go())
+
+
+def test_web_stop_endpoint(tmp_path: Path):
+    """/api/stop:无进行中任务返回 ok=False;有则调用 agent.interrupt()(置位共享信号)。"""
+    import threading
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.post("/api/stop", json={"conversation_id": "none"})
+            assert r.json() == {"ok": False, "reason": "无进行中的任务"}
+
+            interrupted = []
+            class FakeAgent:
+                def interrupt(self):
+                    interrupted.append(True)
+            ev = threading.Event()
+            webmod._RUNNING["abc"] = {"agent": FakeAgent(), "stop_event": ev}
+            try:
+                r2 = await c.post("/api/stop", json={"conversation_id": "abc"})
+                assert r2.json() == {"ok": True}
+                assert interrupted == [True]
+            finally:
+                webmod._RUNNING.pop("abc", None)
+
+            r3 = await c.post("/api/stop", json={"conversation_id": "abc"})
+            assert r3.json()["ok"] is False
+
+    run(go())
+
+
+def test_web_chat_unregisters_running(tmp_path: Path):
+    """chat 完成后从运行中注册表移除(该注册表供 /api/stop 中断时定位 agent)。"""
+    import codingagent.ui.web as webmod
+    session = make_client_session(tmp_path, [("写好了", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.post("/api/chat", json={"conversation_id": cid, "message": "hi"})
+            assert "写好了" in r.text
+            assert cid not in webmod._RUNNING
+
+    run(go())
