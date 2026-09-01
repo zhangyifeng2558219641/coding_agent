@@ -177,6 +177,27 @@ def _worktree(ctx, args: str) -> str:
     return "/worktree list|create [分支]|remove <路径>"
 
 
+def _plan(ctx, args: str):
+    """进入计划模式;带任务时一条龙:只读研究出计划 → 审批 → 执行。"""
+    agent = ctx.agent
+    agent.plan_mode = True
+    if not args.strip():
+        return ("已进入计划模式:只做只读调研并输出计划,不会修改任何文件。\n"
+                "用法:/plan <任务> 一条龙(计划→审批→执行);或直接描述任务,满意后 /execute 退出执行。")
+    agent.run(args.strip())  # 只读调研 + 输出计划(流式展示)
+    if agent.ui.ask("已生成计划(见上)。批准并执行?(y/n)"):
+        agent.plan_mode = False
+        agent.run("请按上面的计划开始执行该任务。")
+        return None  # 执行结果已流式展示,避免 CLI 重复打印
+    return "计划未批准,仍处于计划模式,可继续调整,或 /execute 退出执行。"
+
+
+def _execute(ctx, args: str) -> str:
+    """退出计划模式,开始正常执行(可写文件)。"""
+    ctx.agent.plan_mode = False
+    return "已退出计划模式,现在可以正常执行写操作。如需按之前的计划执行,请直接下达指令。"
+
+
 def _status(ctx, args: str) -> str:
     u = ctx.agent.usage
     return (f"工作区: {ctx.workspace}\n"
@@ -272,3 +293,5 @@ def register_builtin_commands(registry) -> None:
     registry.register(SlashCommand("team", "运行 Agent 团队", _team))
     registry.register(SlashCommand("worktree", "管理 Git worktree", _worktree))
     registry.register(SlashCommand("resume", "恢复 CLI 历史会话(多个会话时交互选择,list 查看列表)", _resume))
+    registry.register(SlashCommand("plan", "进入计划模式(只读调研+输出计划);/plan <任务> 一条龙:计划→审批→执行", _plan))
+    registry.register(SlashCommand("execute", "退出计划模式,开始执行", _execute))

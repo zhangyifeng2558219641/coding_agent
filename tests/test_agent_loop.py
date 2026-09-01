@@ -301,3 +301,65 @@ def test_loop_interrupt_sets_stop_event(workspace: Path):
     result = agent.run("测试")
     assert not result.success
     assert result.error == "用户中断"
+
+
+def test_plan_mode_blocks_write_allows_read(workspace: Path):
+    """计划模式:写工具被硬拦截,读工具正常放行,任务成功收尾。"""
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("先读文件。", [ToolCall(id="1", name="ReadFile", arguments={"path": "a.py"})]),
+        ("再写文件。", [ToolCall(id="2", name="WriteFile",
+                                 arguments={"path": "hello.txt", "content": "plan"})]),
+        ("完成。", []),
+    ])
+    agent.plan_mode = True
+    result = agent.run("调研项目结构")
+    assert result.success
+    assert not (workspace / "hello.txt").exists(), "计划模式禁止写文件"
+    assert {"name": "ReadFile", "status": "ok"} in agent.tool_history
+    assert {"name": "WriteFile", "status": "plan-blocked"} in agent.tool_history
+
+
+def test_plan_mode_schemas_filtered(workspace: Path):
+    """计划模式:暴露给模型的工具只剩只读工具。"""
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, [])
+    names = lambda: {s["function"]["name"] for s in agent._schemas()}
+    assert "ReadFile" in names() and "Glob" in names() and "WriteFile" in names()
+    agent.plan_mode = True
+    only = names()
+    assert "ReadFile" in only and "Glob" in only
+    assert "WriteFile" not in only and "EditFile" not in only and "Bash" not in only
+
+
+def test_plan_mode_bash_whitelist(workspace: Path):
+    """计划模式:Bash 只放行只读命令白名单,危险命令被拦截。"""
+    config = make_config(workspace)
+    agent = make_agent(config, workspace, script=[
+        ("读目录。", [ToolCall(id="1", name="Bash", arguments={"command": "pwd"})]),
+        ("清理目录。", [ToolCall(id="2", name="Bash", arguments={"command": "rm -rf tmp"})]),
+        ("完成。", []),
+    ])
+    agent.plan_mode = True
+    result = agent.run("看看工作区")
+    assert result.success
+    assert {"name": "Bash", "status": "ok"} in agent.tool_history
+    assert {"name": "Bash", "status": "plan-blocked"} in agent.tool_history
+
+
+def test_slash_plan_toggles_mode(workspace: Path):
+    """/plan 置位计划模式,/execute 复位。"""
+    from types import SimpleNamespace
+    from codingagent.commands.builtins import register_builtin_commands
+    from codingagent.commands.slash import SlashRegistry
+
+    agent = make_agent(make_config(workspace), workspace, [])
+    assert not agent.plan_mode
+    ctx = SimpleNamespace(agent=agent)
+    reg = SlashRegistry()
+    register_builtin_commands(reg)
+    assert reg.get("plan") is not None and reg.get("execute") is not None
+    reg.run("plan", "", ctx)
+    assert agent.plan_mode
+    reg.run("execute", "", ctx)
+    assert not agent.plan_mode

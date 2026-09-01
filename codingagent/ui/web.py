@@ -58,6 +58,8 @@ class ChatBody(BaseModel):
     model: Optional[str] = None
     # 编辑重发:截断到该历史索引(丢弃其及之后的消息)再追加新消息
     resend_at: Optional[int] = None
+    # 计划模式:只读调研+输出计划,写工具被硬拦截(前端随每次请求下发)
+    plan_mode: Optional[bool] = None
 
 
 class ConversationStore:
@@ -514,6 +516,8 @@ def create_app(session: Session) -> FastAPI:
                 try:
                     agent = session.make_agent(history=history, ui=ui,
                                                permission_mode=body.permission_mode)
+                    if body.plan_mode is not None:
+                        agent.plan_mode = bool(body.plan_mode)
                     agent.stop_event = stop_event
                     _RUNNING[body.conversation_id]["agent"] = agent
                     ctx = session.context(agent)
@@ -551,6 +555,8 @@ def create_app(session: Session) -> FastAPI:
             try:
                 agent = session.make_agent(history=history, ui=ui,
                                            permission_mode=body.permission_mode)
+                if body.plan_mode is not None:
+                    agent.plan_mode = bool(body.plan_mode)
                 agent.stop_event = stop_event
                 _RUNNING[body.conversation_id]["agent"] = agent
                 if body.model:
@@ -762,6 +768,17 @@ _INDEX_HTML = """<!DOCTYPE html>
                                  cursor:pointer; color:var(--on-accent); flex-shrink:0; }
   #chooseSubmit { background:var(--accent); }
   #chooseCancel { background:var(--err); }
+  /* ---- 计划模式:按钮高亮 + 计划审批条 ---- */
+  #planBtn.active { background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+  #planBar { display:flex; align-items:center; gap:10px; background:var(--panel2);
+             border:1px solid var(--accent); border-radius:8px; padding:8px 12px; font-size:12px; }
+  #planBar.hidden { display:none; }
+  #planText { flex:1; color:var(--text); }
+  #approvePlan { border:none; border-radius:6px; padding:6px 16px; font-size:12px; cursor:pointer;
+                 background:var(--ok); color:var(--on-accent); flex-shrink:0; }
+  #approvePlan:hover { filter:brightness(1.1); }
+  #dismissPlan { border:1px solid var(--border); background:var(--panel); color:var(--dim);
+                 border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; flex-shrink:0; }
   /* ---- 斜杠命令自动补全 ---- */
   #slashMenu { background:var(--panel); border:1px solid var(--border); border-radius:8px;
                max-height:220px; overflow-y:auto; font-size:12px; }
@@ -833,6 +850,7 @@ _INDEX_HTML = """<!DOCTYPE html>
     <button id="importBtn" title="从 JSON 文件恢复会话">导入会话</button>
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
     <button id="clearBtn">清空当前会话</button>
+    <button id="planBtn" title="计划模式:只读调研+输出计划,审批后再执行">计划模式</button>
   </div>
   <div id="messages"></div>
   <div id="inputBar">
@@ -840,6 +858,11 @@ _INDEX_HTML = """<!DOCTYPE html>
       <span id="askText"></span>
       <button id="askAllow">允许</button>
       <button id="askDeny">拒绝</button>
+    </div>
+    <div id="planBar" class="hidden">
+      <span id="planText">已生成计划</span>
+      <button id="approvePlan">批准并执行</button>
+      <button id="dismissPlan">暂不执行</button>
     </div>
     <div id="chooseBar" class="hidden">
       <span id="choosePrompt"></span>
@@ -862,7 +885,8 @@ _INDEX_HTML = """<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 let state = { convs: [], cur: null, busy: false, permMode: "interactive", search: "",
-              resendAt: null, turnOk: false, isSlash: false, renamingId: null };
+              resendAt: null, turnOk: false, isSlash: false, renamingId: null,
+              planMode: false };
 let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
 let slashCommands = [], slashOpen = false, slashIndex = 0, slashItems = [];
 let askQueue = [];  // 待审批确认的 FIFO 队列(团队并行可能多个 pending)
@@ -932,7 +956,8 @@ function startRename(cid, convEl) {
 }
 async function openConv(id) {
   state.cur = id;
-  state.resendAt = null; state.turnOk = false; state.isSlash = false;
+  state.resendAt = null; state.turnOk = false; state.isSlash = false; state.planMode = false;
+  updatePlanBtn(); hidePlanBar();
   refreshList();
   clearAskBar(); clearChooseBar(); closeSlashMenu();
   currentMsg = null; currentBubble = null; roundStart = false;
@@ -1318,8 +1343,16 @@ function flushPending() {
 }
 
 async function send() {
-  const text = $("input").value.trim();
+  let text = $("input").value.trim();
   if (!text || state.busy) return;
+  // 计划模式斜杠翻译:/plan [任务] 进入计划模式并(带任务时)直接规划;/execute 退出
+  if (text.startsWith("/plan")) {
+    const rest = text.slice(5).trim();
+    if (rest) { state.planMode = true; updatePlanBtn(); text = rest; $("input").value = rest; }
+    else { state.planMode = true; updatePlanBtn(); hidePlanBar(); $("input").value = ""; return; }
+  } else if (text === "/execute") {
+    state.planMode = false; updatePlanBtn(); hidePlanBar(); $("input").value = ""; return;
+  }
   if (!state.cur) await newConv();
   // 编辑重发:先把被编辑消息及其后所有已持久化节点从 DOM 移除
   if (state.resendAt != null) {
@@ -1330,6 +1363,7 @@ async function send() {
   }
   const resend_at = state.resendAt;
   state.resendAt = null; state.isSlash = false; state.turnOk = false;
+  hidePlanBar();
   $("input").value = ""; state.busy = true; $("send").disabled = true;
   $("stop").disabled = false; $("stop").textContent = "停止";
   $("stop").classList.remove("hidden");
@@ -1344,7 +1378,7 @@ async function send() {
       headers:{"Content-Type":"application/json"},
       signal: aborter.signal,
       body: JSON.stringify({conversation_id: state.cur, message: text, permission_mode: state.permMode,
-                            resend_at: resend_at})});
+                            resend_at: resend_at, plan_mode: state.planMode})});
     const reader = resp.body.getReader(); const dec = new TextDecoder();
     while (true) {
       const {done, value} = await reader.read();
@@ -1367,6 +1401,19 @@ async function send() {
   $("stop").classList.add("hidden");
   aborter = null;
 }
+
+function updatePlanBtn() {
+  $("planBtn").classList.toggle("active", state.planMode);
+  $("planBtn").textContent = state.planMode ? "★ 计划模式" : "计划模式";
+}
+function showPlanBar() { $("planBar").classList.remove("hidden"); }
+function hidePlanBar() { $("planBar").classList.add("hidden"); }
+function approvePlan() {
+  state.planMode = false; updatePlanBtn(); hidePlanBar();
+  $("input").value = "请按上面的计划开始执行该任务";
+  send();
+}
+function dismissPlan() { hidePlanBar(); }
 
 function handleEvent(ev, wrap) {
   let d; try { d = JSON.parse(ev.data); } catch { d = {}; }
@@ -1413,6 +1460,9 @@ function handleEvent(ev, wrap) {
       // 斜杠命令输入输出现已持久化,同样重渲染以便立即呈现(而非等下次刷新)
       if (state.turnOk || state.isSlash) reloadMessages();
       refreshList();
+      // 计划模式下成功出计划 → 弹出「批准并执行」审批条
+      if (state.planMode && state.turnOk && !state.isSlash) showPlanBar();
+      else hidePlanBar();
       break;
   }
   scheduleFlush();
@@ -1495,6 +1545,9 @@ $("importFile").onchange = async e => {
   }
 };
 $("permSelect").onchange = e => state.permMode = e.target.value;
+$("planBtn").onclick = () => { state.planMode = !state.planMode; updatePlanBtn(); hidePlanBar(); };
+$("approvePlan").onclick = approvePlan;
+$("dismissPlan").onclick = dismissPlan;
 const THEMES = {dark:"深色", light:"浅色", warm:"暖色护眼", nord:"夜间蓝", purple:"南大紫", blue:"软件蓝"};
 function applyTheme(name) {
   if (!THEMES[name]) name = "dark";

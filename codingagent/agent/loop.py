@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,19 @@ from ..types import FinalResult, ToolCall, ToolResult, Usage
 from ..tools import ToolContext, ToolRegistry
 from .memory import MemoryStore
 from .permissions import Decision, PermissionPolicy
+
+# 计划模式:只读调研 + 结构化计划,供 run() 按需注入 system(不入持久化)
+PLAN_MODE_PROMPT = (
+    "【计划模式】你现在处于计划模式:只能进行只读调查,禁止修改/创建/删除任何文件、"
+    "禁止执行有副作用的命令。请先充分调研现状,然后输出结构化实现计划:"
+    "①目标 ②现状与关键发现 ③实施步骤(编号) ④涉及的文件 ⑤验证方式。"
+    "计划完成后停下,等待用户批准后再执行。"
+)
+# 计划模式下允许的只读 shell 命令(研究用),含管道,但拒绝重定向/命令链
+PLAN_READONLY_BASH = re.compile(
+    r"^(git (log|status|diff|show|branch|remote|rev-parse)|ls|cat|head|tail|grep|find|wc|pwd|which|type|date)\b"
+)
+_PLAN_BASH_BAD = re.compile(r"[;>`]|\$\(|&&|\|\|")
 
 
 class UISink:
@@ -103,6 +117,8 @@ class AgentLoop:
         self._tool_history: list[dict[str, Any]] = []
         self._interrupted = False
         self._compact_count = 0
+        # 计划模式:只读调研+出计划;写入工具被硬拦截,只读工具才暴露给模型
+        self.plan_mode = False
         # 线程安全停止信号(Web「停止生成」用):interrupt() 或外部 set() 都会让主循环尽快退出
         self.stop_event = stop_event
 
@@ -130,6 +146,11 @@ class AgentLoop:
     def run(self, user_text: str) -> FinalResult:
         start = time.monotonic()
         self._interrupted = False
+        # 按当前模式增删计划模式系统提示(system 段不入持久化,每轮自清洁)
+        if self.plan_mode:
+            self.history.add_system_part("plan", PLAN_MODE_PROMPT)
+        else:
+            self.history.remove_system_part("plan")
         if user_text.strip():
             self.history.append({"role": "user", "content": user_text})
 
@@ -241,16 +262,35 @@ class AgentLoop:
 
     # ------------------------------------------------------------------ 工具执行
     def _schemas(self) -> list[dict[str, Any]]:
-        if self.options.allow_tools is not None:
-            return [t.to_openai_function() for t in self.registry.all()
-                    if t.name in self.options.allow_tools]
-        return self.registry.schemas()
+        tools = ([t for t in self.registry.all() if t.name in self.options.allow_tools]
+                 if self.options.allow_tools is not None else list(self.registry.all()))
+        # 计划模式:只暴露只读工具,模型自然不会请求写操作
+        if self.plan_mode:
+            tools = [t for t in tools if t.read_only]
+        return [t.to_openai_function() for t in tools]
+
+    def _is_plan_readonly_bash(self, call: ToolCall) -> bool:
+        """计划模式下判断 Bash 命令是否只读(git log/ls/cat 等),含管道可、重定向/链式不可。"""
+        cmd = str(call.arguments.get("command") or "").strip()
+        return bool(PLAN_READONLY_BASH.match(cmd) and not _PLAN_BASH_BAD.search(cmd))
 
     def _execute_tool(self, call: ToolCall) -> ToolResult:
         tool = self.registry.get_ci(call.name)
         if tool is None:
             return ToolResult(name=call.name, call_id=call.id, success=False,
                               error=f"未知工具: {call.name}")
+
+        # 计划模式:硬门控(与 _schemas 过滤互补,兜底模型硬要调写工具的情况)。
+        # Bash 特殊放行只读命令白名单(git log/ls/cat 等),其余写工具一律拒绝。
+        if self.plan_mode and not getattr(tool, "read_only", False):
+            if tool.name != "Bash" or not self._is_plan_readonly_bash(call):
+                self.ui.event("tool_call", {"id": call.id, "name": call.name,
+                                            "arguments": call.arguments,
+                                            "status": "denied",
+                                            "reason": "计划模式仅允许只读操作"})
+                self._tool_history.append({"name": call.name, "status": "plan-blocked"})
+                return ToolResult(name=call.name, call_id=call.id, success=False,
+                                  error="计划模式仅允许只读操作,已禁止本次调用")
 
         # 权限裁决
         decision = self.permissions.decide(call.name, call.arguments, tool)

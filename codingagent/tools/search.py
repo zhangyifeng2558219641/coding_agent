@@ -47,6 +47,7 @@ class Glob(Tool):
         "required": ["pattern"],
     }
     category = "search"
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         pattern = kwargs.get("pattern", "")
@@ -95,6 +96,7 @@ class Grep(Tool):
         "required": ["pattern"],
     }
     category = "search"
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         pattern = kwargs.get("pattern", "")

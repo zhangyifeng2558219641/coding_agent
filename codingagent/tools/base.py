@@ -54,6 +54,8 @@ class Tool:
     category: str = "general"
     # 是否需要对文件/目录等路径参数做沙箱与敏感路径检查
     path_sensitive: bool = False
+    # 只读工具(计划模式仅暴露只读工具,写工具被硬拦截)
+    read_only: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

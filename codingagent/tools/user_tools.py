@@ -39,6 +39,7 @@ class AskUser(Tool):
         "required": ["prompt", "options"],
     }
     category = "general"
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         prompt = str(kwargs.get("prompt") or "").strip() or "请选择一个方向"

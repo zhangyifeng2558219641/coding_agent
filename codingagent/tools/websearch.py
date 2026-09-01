@@ -95,6 +95,7 @@ class WebSearch(Tool):
         "required": ["query"],
     }
     category = "web"
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         query = str(kwargs.get("query", "")).strip()

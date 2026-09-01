@@ -42,6 +42,7 @@ class ReadFile(Tool):
     }
     category = "file"
     path_sensitive = True
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         path = ctx.resolve(kwargs["path"])

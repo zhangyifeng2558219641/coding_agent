@@ -24,6 +24,7 @@ class MemoryRecall(Tool):
         },
     }
     category = "memory"
+    read_only = True
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         scope = kwargs.get("scope", "all")

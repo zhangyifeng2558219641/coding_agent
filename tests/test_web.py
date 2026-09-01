@@ -815,6 +815,29 @@ def test_web_stop_clears_pending_chooses(tmp_path: Path):
     run(go())
 
 
+def test_web_plan_mode_blocks_write(tmp_path: Path):
+    """Web 计划模式:plan_mode=true 下发时写工具被拦截,文件不落盘。"""
+    session = make_client_session(tmp_path, [
+        ("写文件。", [ToolCall(id="1", name="WriteFile",
+                               arguments={"path": "out.txt", "content": "plan"})]),
+        ("写好了。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.post("/api/chat",
+                             json={"conversation_id": cid, "message": "创建 out.txt",
+                                   "plan_mode": True})
+            body = r.text
+            assert "done" in body
+            assert not (tmp_path / "out.txt").exists(), "计划模式禁止写文件"
+            assert "计划模式仅允许只读操作" in body  # tool_call denied 事件含拦截原因
+
+    run(go())
+
+
 def test_web_chat_resend_at_truncates(tmp_path: Path):
     """编辑重发:resend_at 截断历史后追加新消息,旧回复不再出现。"""
     session = make_client_session(tmp_path, [
