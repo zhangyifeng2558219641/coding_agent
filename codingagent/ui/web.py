@@ -82,7 +82,8 @@ class ConversationStore:
 
     def create(self, title: str = "新会话") -> dict[str, Any]:
         cid = uuid.uuid4().hex[:12]
-        now = datetime.now().isoformat(timespec="seconds")
+        # 微秒精度:同秒内连续操作也能区分先后(置顶排序依赖)
+        now = datetime.now().isoformat(timespec="microseconds")
         meta = {"id": cid, "title": title, "created_at": now, "updated_at": now}
         self._meta[cid] = meta
         self._save()
@@ -96,7 +97,7 @@ class ConversationStore:
 
     def touch(self, cid: str, title: Optional[str] = None) -> None:
         if cid in self._meta:
-            self._meta[cid]["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self._meta[cid]["updated_at"] = datetime.now().isoformat(timespec="microseconds")
             if title:
                 self._meta[cid]["title"] = title
             self._save()
@@ -475,6 +476,9 @@ def create_app(session: Session) -> FastAPI:
         if not meta["title"] or meta["title"] == "新会话":
             auto_title = _default_title(body.message)
             store.touch(body.conversation_id, auto_title)
+        else:
+            # 每次发消息都刷新"最近活跃",让该会话置顶
+            store.touch(body.conversation_id)
 
         # 装载/恢复该会话的独立历史(新会话新建,互不共享)
         history = session.load_history(body.conversation_id)
@@ -503,6 +507,10 @@ def create_app(session: Session) -> FastAPI:
             slash_holder: dict[str, Any] = {}
 
             def slash_work() -> None:
+                # 内置命令(如 /team、/status)不写历史,记录输入输出,刷新后不丢失;
+                # 自定义命令经 agent.run 已自行追加、/clear|compact|resume 亦已改动历史,
+                # 以消息数是否变化为判据,避免重复记录或误写。
+                before = len(history.messages)
                 try:
                     agent = session.make_agent(history=history, ui=ui,
                                                permission_mode=body.permission_mode)
@@ -516,6 +524,12 @@ def create_app(session: Session) -> FastAPI:
                     slash_holder["error"] = str(e)
                 finally:
                     _RUNNING.pop(body.conversation_id, None)
+                if len(history.messages) == before:
+                    resp = slash_holder.get("error") and f"命令执行失败: {slash_holder['error']}" \
+                        or slash_holder.get("resp") or "(无输出)"
+                    history.append({"role": "user", "content": body.message})
+                    history.append({"role": "assistant", "content": resp})
+                    session.save_history(history, body.conversation_id)
 
             async def slash_stream():
                 yield _sse("meta", {"type": "slash", "command": body.message})
@@ -1395,8 +1409,9 @@ function handleEvent(ev, wrap) {
     case "error": clearAskBar(); clearChooseBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
     case "done":
       clearAskBar(); clearChooseBar();
-      // 成功且非斜杠命令 → 从持久化历史整体重渲染,让消息节点带真实索引(编辑重发依赖)
-      if (state.turnOk && !state.isSlash) reloadMessages();
+      // 成功回合 → 从持久化历史整体重渲染,让消息节点带真实索引(编辑重发依赖)
+      // 斜杠命令输入输出现已持久化,同样重渲染以便立即呈现(而非等下次刷新)
+      if (state.turnOk || state.isSlash) reloadMessages();
       refreshList();
       break;
   }

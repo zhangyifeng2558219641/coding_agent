@@ -174,6 +174,27 @@ def test_web_conversation_crud(tmp_path: Path):
     run(go())
 
 
+def test_web_chat_bumps_conversation_to_top(tmp_path: Path):
+    """每次发消息都刷新 updated_at,让该会话置顶(即使标题已命名过)。"""
+    session = make_client_session(tmp_path, [("回复1", []), ("回复2", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            a = (await c.post("/api/conversations", json={"title": "会话A"})).json()["id"]
+            b = (await c.post("/api/conversations", json={"title": "会话B"})).json()["id"]
+            # 首次给 A 发消息(A 已命名 → 走 else 分支的 touch)
+            await c.post("/api/chat", json={"conversation_id": a, "message": "你好"})
+            ids = [m["id"] for m in (await c.get("/api/conversations")).json()]
+            assert ids[0] == a, "最近活跃的会话应排最前"
+            # 再给 B 发消息 → B 置顶
+            await c.post("/api/chat", json={"conversation_id": b, "message": "嗨"})
+            ids = [m["id"] for m in (await c.get("/api/conversations")).json()]
+            assert ids[0] == b
+
+    run(go())
+
+
 def test_web_rename_endpoint(tmp_path: Path):
     session = make_client_session(tmp_path, [])
     app = create_app(session)
@@ -310,6 +331,46 @@ def test_web_chat_sse_tool_call(tmp_path: Path):
             assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "web ok"
             got = (await c.get(f"/api/conversations/{cid}")).json()
             assert any(m.get("role") == "tool" for m in got["messages"])
+
+    run(go())
+
+
+def test_web_slash_persists_history(tmp_path: Path):
+    """/tools 这类内置命令的输出刷新后不应丢失:输入与输出要写入会话历史。"""
+    session = make_client_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.post("/api/chat", json={"conversation_id": cid, "message": "/tools"})
+            assert "ReadFile" in r.text and "done" in r.text
+            got = (await c.get(f"/api/conversations/{cid}")).json()
+            roles = [m["role"] for m in got["messages"]]
+            contents = "|".join(m.get("content", "") for m in got["messages"])
+            assert "/tools" in contents
+            assert "ReadFile" in contents
+            assert roles == ["user", "assistant"]
+
+    run(go())
+
+
+def test_web_slash_team_persists_history(tmp_path: Path):
+    """/team 输出较长,同样要落盘历史,刷新后仍能看到汇总内容。"""
+    session = make_client_session(tmp_path, [("成员完成", [])])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            r = await c.post("/api/chat",
+                             json={"conversation_id": cid,
+                                   "message": "/team demo-team 完成一次计划"})
+            assert "done" in r.text
+            got = (await c.get(f"/api/conversations/{cid}")).json()
+            contents = "|".join(m.get("content", "") for m in got["messages"])
+            assert "/team demo-team" in contents
+            assert any(m["role"] == "assistant" and m.get("content") for m in got["messages"])
 
     run(go())
 

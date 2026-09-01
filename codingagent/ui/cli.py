@@ -200,6 +200,7 @@ def run_cli(session) -> None:
         if not line:
             continue
         if line.startswith("/"):
+            before = len(agent.history.messages)
             try:
                 response = session.slash.run(*_split_slash(line), ctx)
             except SlashExit as e:
@@ -207,6 +208,12 @@ def run_cli(session) -> None:
                 break
             if response:
                 console.print(response)
+            # 内置命令(如 /team)不写历史,记录输入输出,与普通对话一样可 /resume 恢复;
+            # 自定义命令经 agent.run 已自行追加,消息数变化即跳过,避免重复记录。
+            if len(agent.history.messages) == before:
+                agent.history.append({"role": "user", "content": line})
+                agent.history.append({"role": "assistant", "content": response or "(无输出)"})
+                session.save_history(agent.history, f"cli-{cli_sid}")
             continue
         try:
             agent.run(line)
