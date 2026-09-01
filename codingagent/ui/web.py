@@ -12,6 +12,7 @@ import json
 import queue
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,12 @@ from .export import conversation_to_markdown, conversation_to_text
 # ---------------------------------------------------------------------------
 
 _RUNNING: dict[str, dict[str, Any]] = {}
+
+# 待审批确认注册表(供 /api/respond 回填答案)
+# conversation_id -> {qid: {"event": threading.Event, "answer": bool|None}}
+_ASKS: dict[str, dict[str, dict[str, Any]]] = {}
+# ask 超时(秒):超时未响应按拒绝处理,避免 worker 线程永久挂起
+_ASK_TIMEOUT = 600
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +114,40 @@ class ConversationStore:
 # ---------------------------------------------------------------------------
 
 class SSEUI(UISink):
-    def __init__(self, emit):
+    def __init__(self, emit, cid: Optional[str] = None,
+                 stop_event: Optional[threading.Event] = None):
         self._emit = emit  # (type, data) -> None,线程安全
+        self._cid = cid
+        self._stop_event = stop_event
 
     def event(self, type: str, data: dict[str, Any]) -> None:
         self._emit(type, data)
 
     def ask(self, question: str) -> bool:
-        # Web 无交互确认能力:由权限策略(mode)决定,ASL 一律拒绝
-        return False
+        """交互式审批:发出 ask 事件后阻塞等待用户经 /api/respond 回答。
+
+        无 cid(未接 Web 通道)或停止/超时一律按拒绝(False)处理。
+        """
+        if not self._cid:
+            return False
+        qid = uuid.uuid4().hex[:8]
+        entry = {"event": threading.Event(), "answer": None}
+        _ASKS.setdefault(self._cid, {})[qid] = entry
+        self._emit("ask", {"id": qid, "question": question})
+        try:
+            deadline = time.monotonic() + _ASK_TIMEOUT
+            while not entry["event"].wait(0.2):
+                if self._stop_event is not None and self._stop_event.is_set():
+                    return False
+                if time.monotonic() >= deadline:
+                    return False
+            return bool(entry["answer"])
+        finally:
+            bucket = _ASKS.get(self._cid)
+            if bucket:
+                bucket.pop(qid, None)
+                if not bucket:
+                    _ASKS.pop(self._cid, None)
 
 
 def _sse(type: str, data: dict[str, Any]) -> str:
@@ -307,10 +339,11 @@ def create_app(session: Session) -> FastAPI:
 
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
-        ui = SSEUI(lambda t, d: loop.call_soon_threadsafe(q.put_nowait, (t, d)))
         # 每个请求独立停止信号;agent 创建后挂上去,Web「停止生成」/跳转页面都会中止
         stop_event = threading.Event()
         _RUNNING[body.conversation_id] = {"agent": None, "stop_event": stop_event}
+        ui = SSEUI(lambda t, d: loop.call_soon_threadsafe(q.put_nowait, (t, d)),
+                   cid=body.conversation_id, stop_event=stop_event)
 
         if body.message.startswith("/"):
             # 斜杠命令(尤其 /team 这类长任务)也在 worker 线程执行并实时下发队列事件,
@@ -383,8 +416,11 @@ def create_app(session: Session) -> FastAPI:
 
     @app.post("/api/stop")
     def stop(body: dict[str, Any]):
-        """中断指定会话进行中的生成(agent.interrupt() → stop_event 置位)。"""
+        """中断指定会话进行中的生成(agent.interrupt() → stop_event 置位),并解除待审批阻塞。"""
         cid = (body or {}).get("conversation_id", "")
+        for entry in _ASKS.pop(cid, {}).values():
+            entry["answer"] = False
+            entry["event"].set()
         entry = _RUNNING.get(cid)
         if not entry or entry.get("agent") is None:
             return {"ok": False, "reason": "无进行中的任务"}
@@ -393,6 +429,18 @@ def create_app(session: Session) -> FastAPI:
             return {"ok": True}
         except Exception as e:  # pragma: no cover
             return {"ok": False, "reason": str(e)}
+
+    @app.post("/api/respond")
+    def respond(body: dict[str, Any]):
+        """回填某个待审批确认的答案(Web 输入框「允许/拒绝」)。"""
+        cid = (body or {}).get("conversation_id", "")
+        qid = (body or {}).get("id", "")
+        entry = _ASKS.get(cid, {}).get(qid)
+        if not entry:
+            return {"ok": False}
+        entry["answer"] = bool((body or {}).get("allow", False))
+        entry["event"].set()
+        return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -478,7 +526,8 @@ _INDEX_HTML = """<!DOCTYPE html>
   .cursor { display:inline-block; width:8px; height:16px; background:var(--text);
             vertical-align:-2px; animation:blink 1s infinite; }
   @keyframes blink { 50% { opacity:0; } }
-  #inputBar { display:flex; gap:10px; padding:14px 20px; border-top:1px solid var(--border); }
+  #inputBar { display:flex; flex-direction:column; gap:8px; padding:10px 20px 14px; border-top:1px solid var(--border); }
+  #inputRow { display:flex; gap:10px; }
   #input { flex:1; background:var(--panel2); border:1px solid var(--border); border-radius:10px;
            color:var(--text); padding:12px 14px; font-size:14px; outline:none; resize:none; height:50px; }
   #input:focus { border-color:var(--accent); }
@@ -488,6 +537,24 @@ _INDEX_HTML = """<!DOCTYPE html>
   #stop:hover:not(:disabled) { background:rgba(255,107,107,.28); }
   #stop:disabled { opacity:.5; cursor:not-allowed; }
   #stop.hidden { display:none; }
+  /* ---- 输入框上方的权限审批条 ---- */
+  #askBar { display:flex; align-items:center; gap:10px; background:var(--panel2);
+            border:1px solid var(--accent); border-radius:8px; padding:8px 12px; font-size:12px; }
+  #askBar.hidden { display:none; }
+  #askText { flex:1; color:var(--text); word-break:break-all; white-space:pre-wrap; }
+  #askAllow, #askDeny { border:none; border-radius:6px; padding:6px 14px; font-size:12px;
+                        cursor:pointer; color:var(--on-accent); flex-shrink:0; }
+  #askAllow { background:var(--ok); }
+  #askDeny { background:var(--err); }
+  /* ---- 斜杠命令自动补全 ---- */
+  #slashMenu { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+               max-height:220px; overflow-y:auto; font-size:12px; }
+  #slashMenu.hidden { display:none; }
+  #slashMenu .si { padding:6px 12px; cursor:pointer; display:flex; justify-content:space-between;
+                   gap:16px; color:var(--text); }
+  #slashMenu .si:hover, #slashMenu .si.sel { background:var(--accent); color:var(--on-accent); }
+  #slashMenu .sd { color:var(--dim); }
+  #slashMenu .si.sel .sd { color:var(--on-accent); opacity:.8; }
   .badge { padding:2px 8px; border-radius:10px; font-size:11px; }
   .badge.ok { background:rgba(61,220,132,.15); color:var(--ok); }
   .badge.err { background:rgba(255,107,107,.15); color:var(--err); }
@@ -548,9 +615,17 @@ _INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div id="messages"></div>
   <div id="inputBar">
-    <textarea id="input" placeholder="输入任务,回车发送;Shift+Enter 换行;/help 查看命令"></textarea>
-    <button id="send">发送</button>
-    <button id="stop" class="hidden">停止</button>
+    <div id="askBar" class="hidden">
+      <span id="askText"></span>
+      <button id="askAllow">允许</button>
+      <button id="askDeny">拒绝</button>
+    </div>
+    <div id="slashMenu" class="hidden"></div>
+    <div id="inputRow">
+      <textarea id="input" placeholder="输入任务,回车发送;Shift+Enter 换行;输入 / 弹出命令"/></textarea>
+      <button id="send">发送</button>
+      <button id="stop" class="hidden">停止</button>
+    </div>
   </div>
 </div>
 
@@ -558,6 +633,8 @@ _INDEX_HTML = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let state = { convs: [], cur: null, busy: false, permMode: "interactive" };
 let aborter = null; // 当前请求的 AbortController;「停止生成」中止 fetch 并 POST /api/stop
+let slashCommands = [], slashOpen = false, slashIndex = 0, slashItems = [];
+let askQueue = [];  // 待审批确认的 FIFO 队列(团队并行可能多个 pending)
 
 async function api(path, opts={}) {
   const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
@@ -569,6 +646,7 @@ async function refreshConfig() {
     const c = await api("/api/config");
     $("modelLabel").textContent = `模型: ${c.provider.model} · ${c.provider.base_url}`;
     $("footer").textContent = `工作区: ${c.workspace} | 工具: ${(c.tools||[]).length} 个`;
+    slashCommands = parseSlashCmds(c.slash_commands);
   } catch(e) {}
 }
 async function refreshList() {
@@ -591,6 +669,7 @@ async function refreshList() {
 async function openConv(id) {
   state.cur = id;
   refreshList();
+  clearAskBar(); closeSlashMenu();
   currentMsg = null; currentBubble = null; roundStart = false;
   try {
     const data = await api("/api/conversations/" + id);
@@ -606,6 +685,72 @@ async function newConv() {
   await openConv(c.id);
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- 斜杠命令自动补全(数据来自 /api/config 的 slash_commands) ----
+function parseSlashCmds(list) {
+  return (list || []).map(s => {
+    const sp = s.indexOf(" - ");
+    return { cmd: sp > 0 ? s.slice(1, sp) : s.slice(1),
+             desc: sp > 0 ? s.slice(sp + 3) : "" };
+  });
+}
+function slashAt(value, caret) {
+  const before = value.slice(0, caret);
+  const sp = Math.max(before.lastIndexOf(" "), before.lastIndexOf("\\n"));
+  const token = before.slice(sp + 1);
+  if (!token.startsWith("/")) return null;
+  return { start: sp + 1, text: token.slice(1).toLowerCase() };
+}
+function renderSlashMenu() {
+  const menu = $("slashMenu");
+  if (!slashItems.length) { closeSlashMenu(); return; }
+  menu.innerHTML = slashItems.map((c, i) =>
+    `<div class="si${i === slashIndex ? " sel" : ""}" data-i="${i}"><span>/${esc(c.cmd)}</span><span class="sd">${esc(c.desc)}</span></div>`).join("");
+  menu.classList.remove("hidden");
+}
+function openSlashMenu(tok) {
+  slashItems = slashCommands.filter(c => !tok || c.cmd.startsWith(tok));
+  slashIndex = 0;
+  slashOpen = true;
+  renderSlashMenu();
+}
+function closeSlashMenu() {
+  slashOpen = false; slashItems = [];
+  $("slashMenu").classList.add("hidden");
+}
+function selectSlash(i) {
+  const item = slashItems[i];
+  const input = $("input");
+  const at = slashAt(input.value, input.selectionStart);
+  if (!at || !item) { closeSlashMenu(); return; }
+  const value = input.value;
+  input.value = value.slice(0, at.start) + "/" + item.cmd + " " + value.slice(input.selectionStart);
+  const pos = at.start + item.cmd.length + 2;
+  input.setSelectionRange(pos, pos);
+  closeSlashMenu();
+  input.focus();
+}
+
+// ---- 权限审批条(agent 在 interactive 模式下请求确认时弹出) ----
+function renderAskBar() {
+  const bar = $("askBar");
+  if (!askQueue.length) { bar.classList.add("hidden"); return; }
+  $("askText").textContent = askQueue[0].question;
+  bar.classList.remove("hidden");
+}
+function clearAskBar() {
+  askQueue = [];
+  renderAskBar();
+}
+async function respondAsk(allow) {
+  if (!askQueue.length) return;
+  const q = askQueue.shift();
+  try {
+    await api("/api/respond", {method:"POST",
+      body: JSON.stringify({conversation_id: state.cur, id: q.id, allow})});
+  } catch(e) {}
+  renderAskBar();
+}
 
 // ---- 自写 Markdown 渲染 + 代码高亮(零外部依赖;所有文本先转义,杜绝注入) ----
 function mdEscape(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
@@ -884,8 +1029,12 @@ function handleEvent(ev, wrap) {
                      const s = document.createElement("div");
                      s.className="msg system"; s.innerHTML=`<div class="bubble">${esc(d.message||"")}</div>`;
                      wrap.appendChild(s); wrap.scrollTop = wrap.scrollHeight; break; }
-    case "error": ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
-    case "done": refreshList(); break;
+    case "ask":
+      askQueue.push({id: d.id, question: d.question});
+      renderAskBar();
+      break;
+    case "error": clearAskBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
+    case "done": clearAskBar(); refreshList(); break;
   }
   scheduleFlush();
 }
@@ -893,6 +1042,7 @@ function handleEvent(ev, wrap) {
 async function stopGenerate() {
   if (!aborter) return;
   $("stop").disabled = true; $("stop").textContent = "停止中…";
+  clearAskBar();
   // 先让后端 agent 尽快中断(置位 stop_event),再中止前端 fetch,双保险
   try { await api("/api/stop", {method:"POST", body: JSON.stringify({conversation_id: state.cur})}); }
   catch(e) {}
@@ -901,8 +1051,26 @@ async function stopGenerate() {
 $("stop").onclick = stopGenerate;
 $("send").onclick = send;
 $("input").addEventListener("keydown", e => {
+  if (slashOpen) {
+    if (e.key === "ArrowDown") { e.preventDefault(); slashIndex = (slashIndex + 1) % slashItems.length; renderSlashMenu(); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); slashIndex = (slashIndex - 1 + slashItems.length) % slashItems.length; renderSlashMenu(); return; }
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); selectSlash(slashIndex); return; }
+    if (e.key === "Escape") { e.preventDefault(); closeSlashMenu(); return; }
+  }
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
+$("input").addEventListener("input", e => {
+  const at = slashAt($("input").value, $("input").selectionStart);
+  if (at !== null) openSlashMenu(at.text);
+  else closeSlashMenu();
+});
+$("input").addEventListener("blur", () => setTimeout(closeSlashMenu, 150));
+$("slashMenu").onclick = e => {
+  const div = e.target.closest(".si");
+  if (div) selectSlash(+div.dataset.i);
+};
+$("askAllow").onclick = () => respondAsk(true);
+$("askDeny").onclick = () => respondAsk(false);
 $("newBtn").onclick = newConv;
 $("clearBtn").onclick = async () => { await sendSlash("/clear"); };
 $("exportSel").onchange = e => {

@@ -34,6 +34,26 @@ def make_client_session(workspace: Path, script):
     return session
 
 
+def make_ask_session(workspace: Path, script):
+    """interactive 权限模式 + WriteFile 需确认,用于审批交互测试。"""
+    from codingagent.config import Config
+    cfg = Config({"provider": {"model": "mock", "base_url": "mock"},
+                  "context": {"budget_tokens": 64000, "max_tool_output": 10000},
+                  "agent": {"max_iterations": 10},
+                  "permissions": {"mode": "interactive", "sandbox": True,
+                                  "ask_tools": ["WriteFile"]},
+                  "memory": {"enabled": False},
+                  "skills": {"dirs": []},
+                  "commands": {"dir": str(workspace / ".coding_agent" / "commands")},
+                  "mcp": {"servers": {}},
+                  "teams": {},
+                  "sessions_dir": str(workspace / ".coding_agent" / "sessions")},
+                 workspace)
+    session = Session(cfg)
+    session.client = MockClient(script)
+    return session
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -55,6 +75,36 @@ def sse_events(text: str) -> list[tuple[str, str]]:
         if e:
             out.append((e, "\n".join(data)))
     return out
+
+
+async def chat_with_ask(c, cid, message, allow):
+    """后台跑 /api/chat(读完整 body),轮询 _ASKS 注册表见到 pending 即回 /api/respond。
+
+    ASGITransport 缓冲整段响应,不能边读流边发请求;改为后台任务读 body,
+    主流程直接轮询注册表定位 ask 的 qid,再 /api/respond 解锁。
+    """
+    import codingagent.ui.web as webmod
+
+    async def run_chat():
+        async with c.stream("POST", "/api/chat",
+                            json={"conversation_id": cid, "message": message}) as r:
+            return (await r.aread()).decode("utf-8")
+
+    task = asyncio.create_task(run_chat())
+    qid = None
+    for _ in range(200):  # 最多 ~4s 等 ask 注册
+        bucket = webmod._ASKS.get(cid) or {}
+        if bucket:
+            qid = next(iter(bucket))
+            break
+        await asyncio.sleep(0.02)
+    if qid is None:
+        task.cancel()
+        raise AssertionError("未收到 ask 事件(注册表无 pending)")
+    rr = await c.post("/api/respond",
+                      json={"conversation_id": cid, "id": qid, "allow": allow})
+    assert rr.status_code == 200
+    return await asyncio.wait_for(task, timeout=5)
 
 
 def test_web_health_and_config(tmp_path: Path):
@@ -378,5 +428,83 @@ def test_web_import_empty_messages(tmp_path: Path):
                              json={"messages": [{"role": "system", "content": "x"}]})
             assert r.status_code == 400
             assert "没有可导入" in r.text
+
+    run(go())
+
+
+def test_web_ask_permission_allow(tmp_path: Path):
+    """interactive 模式下 WriteFile 需确认:ask → 允许 → 工具执行、流正常收尾。"""
+    import codingagent.ui.web as webmod
+    session = make_ask_session(tmp_path, [
+        ("写文件。", [ToolCall(id="1", name="WriteFile",
+                               arguments={"path": "out.txt", "content": "ask ok"})]),
+        ("写好了。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            body = await chat_with_ask(c, cid, "写 out.txt", True)
+            assert "event: ask" in body and "event: done" in body
+            assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "ask ok"
+            assert cid not in webmod._ASKS  # ask 完成后注册表已清空
+
+    run(go())
+
+
+def test_web_ask_permission_deny(tmp_path: Path):
+    """interactive 模式下 WriteFile 需确认:ask → 拒绝 → 工具不执行。"""
+    import codingagent.ui.web as webmod
+    session = make_ask_session(tmp_path, [
+        ("写文件。", [ToolCall(id="1", name="WriteFile",
+                               arguments={"path": "out.txt", "content": "ask ok"})]),
+        ("写好了。", []),
+    ])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = (await c.post("/api/conversations", json={})).json()["id"]
+            body = await chat_with_ask(c, cid, "写 out.txt", False)
+            assert "event: ask" in body and "event: done" in body
+            assert not (tmp_path / "out.txt").exists()
+            assert cid not in webmod._ASKS
+
+    run(go())
+
+
+def test_web_respond_unknown(tmp_path: Path):
+    """/api/respond 指向不存在的确认 → ok False。"""
+    session = make_ask_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            r = await c.post("/api/respond", json={"conversation_id": "x", "id": "nope", "allow": True})
+            assert r.json() == {"ok": False}
+
+    run(go())
+
+
+def test_web_stop_clears_pending_asks(tmp_path: Path):
+    """/api/stop 解除并清理该会话所有待审批阻塞。"""
+    import threading
+    import codingagent.ui.web as webmod
+    session = make_ask_session(tmp_path, [])
+    app = create_app(session)
+
+    async def go():
+        async with client(app) as c:
+            cid = "fakeask"
+            ev = threading.Event()
+            webmod._ASKS[cid] = {"q1": {"event": ev, "answer": None}}
+            try:
+                r = await c.post("/api/stop", json={"conversation_id": cid})
+                assert r.json()["ok"] is False  # 无进行中的任务,但待审批已清理
+                assert ev.is_set()
+                assert cid not in webmod._ASKS
+            finally:
+                webmod._ASKS.pop(cid, None)
 
     run(go())
