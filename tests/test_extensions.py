@@ -138,6 +138,56 @@ def test_mcp_manager_connect(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Worktree
+# ---------------------------------------------------------------------------
+
+def _make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    for a in (["init", "-q"], ["config", "user.email", "t@t.t"],
+              ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(repo), *a], check=True,
+                       capture_output=True, text=True, encoding="utf-8")
+    (repo / "a.txt").write_text("v1", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
+    return repo
+
+
+def test_worktree_create_list_remove(tmp_path: Path):
+    from codingagent.agent.worktree import WorktreeManager
+    repo = _make_repo(tmp_path)
+    mgr = WorktreeManager(repo)
+    assert mgr.is_repo()
+    info = mgr.create(branch="feature-x")
+    assert info.path.exists() and (info.path / "a.txt").exists()
+    assert any("feature-x" in w.branch for w in mgr.list())
+    mgr.remove(info.path)
+    assert not info.path.exists()
+    assert len(mgr.list()) == 1
+
+
+def test_worktree_slash_handler(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from codingagent.commands import SlashRegistry
+    from codingagent.commands.builtins import register_builtin_commands
+    repo = _make_repo(tmp_path)
+    reg = SlashRegistry()
+    register_builtin_commands(reg)
+    ctx = SimpleNamespace(workspace=repo)
+    out = reg.run("worktree", "create feature-a", ctx)
+    assert "已创建" in out
+    wt = repo.parent / f"{repo.name}.feature-a"
+    assert wt.exists()
+    assert "branch=" in reg.run("worktree", "list", ctx)
+    out2 = reg.run("worktree", f"remove {wt}", ctx)
+    assert "已移除" in out2 and not wt.exists()
+
+
+# ---------------------------------------------------------------------------
 # 技能
 # ---------------------------------------------------------------------------
 
