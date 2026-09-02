@@ -252,6 +252,69 @@ def test_history_compact(workspace: Path):
     assert h.system_prompt()  # 摘要已并入 system
 
 
+def test_safe_cut_never_splits_tool_block():
+    """safe_cut 裁剪点不得落在 tool 序列中间,否则产生孤儿 tool 消息被 API 拒绝。"""
+    from codingagent.llm.history import safe_cut
+
+    def block(c0, c1):
+        return [{"role": "assistant", "content": "", "tool_calls": [
+                    {"id": c0, "type": "function", "function": {"name": "T", "arguments": "{}"}},
+                    {"id": c1, "type": "function", "function": {"name": "T", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": c0, "content": "r0"},
+                {"role": "tool", "tool_call_id": c1, "content": "r1"}]
+
+    msgs = [{"role": "user", "content": f"u{i}"} for i in range(5)] + block("c0", "c1")
+    n = len(msgs)  # 8
+    # 边界指向 tool 块内部(assistant 在 index5,两个 tool 在 6、7)
+    assert safe_cut(msgs, 6) == 5
+    assert safe_cut(msgs, 7) == 5
+    # 边界在块起点(5)或更早,原样保留
+    assert safe_cut(msgs, 5) == 5
+    assert safe_cut(msgs, 4) == 4
+    # 越界/0 边界
+    assert safe_cut(msgs, 0) == 0
+    assert safe_cut(msgs, 99) == n
+
+
+def test_history_compact_does_not_split_tool_block(workspace: Path):
+    """压缩裁剪点落在 tool 块内时,应回退到块起点整块保留,避免 400。"""
+    from codingagent.llm.history import History
+
+    calls = {"n": 0}
+
+    def summarize_fn(instruction: str) -> str:
+        calls["n"] += 1
+        return "压缩摘要"
+
+    h = History(budget_tokens=100000)
+    # 0..6 普通消息;7 为 assistant tool_calls(4 个),8..11 为 tool 回应;
+    # 12..19 再补 8 条。n=20,旧裁剪点 n-KEEP_RECENT=8 正好落在第一条 tool 上 → 会孤儿。
+    for i in range(7):
+        h.append({"role": "user", "content": f"u{i}"})
+    h.append({"role": "assistant", "content": "", "tool_calls": [
+        {"id": f"c{j}", "type": "function", "function": {"name": "T", "arguments": "{}"}} for j in range(4)]})
+    for j in range(4):
+        h.append({"role": "tool", "tool_call_id": f"c{j}", "content": f"r{j}"})
+    for i in range(8):
+        h.append({"role": "user", "content": f"t{i}"})
+
+    assert h.compact(summarize_fn)
+    assert calls["n"] == 1
+    msgs = h.messages
+    # 保留部分以块边界开头:不能是 tool 消息,必须带 tool_calls 的 assistant 开头
+    assert msgs[0]["role"] == "assistant"
+    assert msgs[0].get("tool_calls")
+    # 逐条校验无孤儿 tool
+    pending = []
+    for m in msgs:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            pending = [tc["id"] for tc in m["tool_calls"]]
+        elif m.get("role") == "tool":
+            assert m["tool_call_id"] in pending
+            pending.remove(m["tool_call_id"])
+    assert not pending
+
+
 def test_loop_retries_empty_response(workspace: Path):
     """模型首轮返回空响应(无文本且无工具调用)应自动重试,而非直接报错。"""
     config = make_config(workspace)

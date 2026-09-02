@@ -19,6 +19,28 @@ from .tokens import estimate_messages_tokens
 KEEP_RECENT = 12
 
 
+def safe_cut(messages: list[dict], index: int) -> int:
+    """把裁剪下标回退到最近的"块边界",保证不切开 tool_calls 与其工具结果。
+
+    一条带 tool_calls 的 assistant 及其紧随的所有 tool 消息是一个不可拆分的原子块;
+    其余单条消息自成一块。返回 ≤ index 的块边界下标,使裁剪后的 [cut:] 仍是
+    OpenAI 合法的消息序列(否则 API 会报 "role 'tool' 前没有 tool_calls" 的 400)。
+    """
+    n = len(messages)
+    if index <= 0 or index >= n:
+        return max(0, min(index, n))
+    i = 0
+    while i < n:
+        block_end = i + 1
+        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
+            while block_end < n and messages[block_end].get("role") == "tool":
+                block_end += 1
+        if block_end > index:
+            return i
+        i = block_end
+    return index
+
+
 class History:
     def __init__(
         self,
@@ -111,8 +133,11 @@ class History:
         """
         if len(self.messages) <= KEEP_RECENT:
             return False
-        old = self.messages[:-KEEP_RECENT]
-        self.messages = self.messages[-KEEP_RECENT:]
+        cut = safe_cut(self.messages, len(self.messages) - KEEP_RECENT)
+        if cut <= 0:
+            return False
+        old = self.messages[:cut]
+        self.messages = self.messages[cut:]
 
         payload = json.dumps(old, ensure_ascii=False)[:30000]
         instruction = (

@@ -534,9 +534,11 @@ def create_app(session: Session) -> FastAPI:
                 max_tool_output=session.config.context.get("max_tool_output", 30000),
             )
 
-        # 编辑重发:截断到该历史索引(丢弃被编辑消息及其之后),再追加新消息
+        # 编辑重发:截断到该历史索引(丢弃被编辑消息及其之后),再追加新消息。
+        # 索引需对齐到块边界,否则切在 tool 序列中间会生成"孤立的 tool 消息"被模型 API 拒绝。
         if body.resend_at is not None and 0 <= body.resend_at < len(history.messages):
-            history.messages = history.messages[:body.resend_at]
+            from ..llm.history import safe_cut
+            history.messages = history.messages[:safe_cut(history.messages, body.resend_at)]
 
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
@@ -1525,6 +1527,13 @@ function flushPending() {
   const wrap = $("messages");
   wrap.scrollTop = wrap.scrollHeight;
 }
+function appendToBubble(text) {
+  // 确保气泡存在并挂到 pendingBubble,让 flushPending 真正渲染;
+  // 否则在无 text 事件(如缺 API key 直接报错)时,追加的内容永远不会显示
+  pendingBubble = ensureAssistantBubble();
+  pendingBubble._md += text;
+  scheduleFlush();
+}
 
 async function send() {
   let text = $("input").value.trim();
@@ -1576,9 +1585,9 @@ async function send() {
     }
   } catch(e) {
     if (e.name === "AbortError") {
-      ensureAssistantBubble(); currentBubble._md += "\\n⏹ 已停止生成"; scheduleFlush();
+      appendToBubble("\\n⏹ 已停止生成");
     } else {
-      ensureAssistantBubble(); currentBubble._md += "\\n请求失败: " + e.message; scheduleFlush();
+      appendToBubble("\\n请求失败: " + e.message);
     }
   }
   clearCursor(); state.busy = false; $("send").disabled = false;
@@ -1640,7 +1649,7 @@ function handleEvent(ev, wrap) {
     case "checkpoint":
       refreshCheckpoints();
       break;
-    case "error": clearAskBar(); clearChooseBar(); ensureAssistantBubble(); currentBubble._md += "\\n✗ " + (d.message || ""); break;
+    case "error": clearAskBar(); clearChooseBar(); appendToBubble("\\n✗ " + (d.message || "")); break;
     case "done":
       clearAskBar(); clearChooseBar();
       // 成功回合 → 从持久化历史整体重渲染,让消息节点带真实索引(编辑重发依赖)
