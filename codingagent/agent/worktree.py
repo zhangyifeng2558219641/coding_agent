@@ -81,11 +81,24 @@ class WorktreeManager:
             infos.append(WorktreeInfo(**cur))
         return infos
 
-    def remove(self, path: Path) -> bool:
-        p = path.resolve()
-        infos = self.list()
-        if not any(i.path.resolve() == p for i in infos):
-            raise WorktreeError(f"不是注册的 worktree: {p}")
-        # 默认清理后直接删除目录(交给调用方确认)
+    def remove(self, branch_or_path: str | Path) -> bool:
+        """移除一个 worktree;参数可为已注册路径,也可为分支名(短名/完整名均可)。"""
+        p = self._resolve_path(str(branch_or_path))
         self._git("worktree", "remove", "--force", str(p))
         return True
+
+    def _resolve_path(self, branch_or_path: str) -> Path:
+        """把 路径 / 分支短名 / 分支完整名 解析成已注册的 worktree 路径。"""
+        infos = self.list()
+        requested = Path(branch_or_path).resolve()
+        for i in infos:
+            if i.path.resolve() == requested:
+                return i.path
+        for i in infos:
+            short = i.branch[len("refs/heads/"):] if i.branch.startswith("refs/heads/") else i.branch
+            if branch_or_path in (i.branch, short):
+                return i.path
+        candidate = (self.repo.parent / f"{self.repo.name}.{branch_or_path}").resolve()
+        if any(candidate == i.path.resolve() for i in infos):
+            return Path(candidate)
+        raise WorktreeError(f"不是注册的 worktree: {branch_or_path}")

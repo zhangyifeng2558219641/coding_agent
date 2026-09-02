@@ -187,6 +187,24 @@ def test_worktree_slash_handler(tmp_path: Path):
     assert "已移除" in out2 and not wt.exists()
 
 
+def test_worktree_remove_by_branch_name(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from codingagent.commands import SlashRegistry
+    from codingagent.commands.builtins import register_builtin_commands
+    repo = _make_repo(tmp_path)
+    reg = SlashRegistry()
+    register_builtin_commands(reg)
+    ctx = SimpleNamespace(workspace=repo)
+    assert "已创建" in reg.run("worktree", "create mytest", ctx)
+    wt = repo.parent / f"{repo.name}.mytest"
+    assert wt.exists()
+    out = reg.run("worktree", "remove mytest", ctx)
+    assert "已移除" in out and not wt.exists()
+    # 不存在分支名/路径 → 报错,不误删
+    assert "失败" in reg.run("worktree", "remove nope", ctx)
+
+
 # ---------------------------------------------------------------------------
 # 技能
 # ---------------------------------------------------------------------------

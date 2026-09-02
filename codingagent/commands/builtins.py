@@ -168,13 +168,13 @@ def _worktree(ctx, args: str) -> str:
             return f"创建失败: {e}"
     if cmd == "remove":
         if len(a) < 2:
-            return "/worktree remove <路径>"
+            return "/worktree remove <路径或分支名>"
         try:
-            mgr.remove(Path(a[1]))
+            mgr.remove(a[1])
             return f"已移除 worktree: {a[1]}"
         except WorktreeError as e:
             return f"移除失败: {e}"
-    return "/worktree list|create [分支]|remove <路径>"
+    return "/worktree list|create [分支]|remove <路径或分支名>"
 
 
 def _plan(ctx, args: str):
